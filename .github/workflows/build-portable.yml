@@ -1,0 +1,151 @@
+# =============================================================================
+# 房源组合最优解计算器 — Windows 便携版构建与发布工作流
+#
+# 触发条件：
+#   1. 推送到 main 分支          → 构建并上传为 "continuous" 预发布版
+#   2. 创建版本标签 v*.*.*（如 v0.1.0）→ 构建并上传到对应版本的正式 Release
+#   3. 手动触发（workflow_dispatch）
+#
+# 产物：绿色免安装 zip（解压即用的 house-combo-solver.exe）
+#   - Rust (MSVC) 默认静态链接 CRT，应用代码与运行时全部内嵌于单个 exe
+#   - 唯一外部依赖为系统 WebView2 运行时（Windows 10/11 已内置），故 exe 可直接运行
+# =============================================================================
+
+name: Build Windows Portable & Release
+
+on:
+  push:
+    branches: [main]        # 主分支推送
+    tags: ['v*.*.*']        # 版本标签，如 v1.0.0
+  workflow_dispatch: {}     # 手动触发（Actions 页面点击 Run workflow）
+
+# Release 上传需要写入权限（GitHub 仓库需允许 GITHUB_TOKEN 写 contents）
+permissions:
+  contents: write
+
+# 同一分支/标签的并发构建：新推送取消旧构建，节省 CI 分钟数
+concurrency:
+  group: portable-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-windows-portable:
+    name: Build portable exe (windows-latest)
+    runs-on: windows-latest
+
+    env:
+      APP_NAME: house-combo-solver   # 二进制名 = Cargo.toml [package].name
+
+    steps:
+      # ---------------------------------------------------------------------
+      # 1. 检出代码
+      # ---------------------------------------------------------------------
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ---------------------------------------------------------------------
+      # 2. 安装 Rust 工具链（MSVC）
+      #    windows-latest 自带 MSVC 构建工具 + WebView2，无需额外系统依赖
+      # ---------------------------------------------------------------------
+      - name: Setup Rust (MSVC)
+        uses: dtolnay/rust-toolchain@stable
+
+      # ---------------------------------------------------------------------
+      # 3. 安装 Node.js（前端构建）+ npm 依赖缓存
+      #    actions/setup-node 的 cache: npm 按 package-lock.json 缓存 node_modules
+      # ---------------------------------------------------------------------
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # ---------------------------------------------------------------------
+      # 4. Cargo 依赖缓存（核心提速项）
+      #    Swatinem/rust-cache 按 Cargo.lock / rust toolchain 自动生成缓存键，
+      #    增量构建可将 10~20 分钟首次编译压缩到 3~5 分钟
+      # ---------------------------------------------------------------------
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri          # 本项目 Cargo 工作区位于 src-tauri/
+
+      # ---------------------------------------------------------------------
+      # 5. 安装前端依赖（npm ci 严格按锁文件，CI 首选）
+      # ---------------------------------------------------------------------
+      - name: Install frontend deps
+        run: npm ci
+
+      # ---------------------------------------------------------------------
+      # 6. 构建 Tauri release 二进制（不打包安装器）
+      #    --no-bundle：仅产出 target/release/house-combo-solver.exe，
+      #    跳过 NSIS/MSI 打包，缩短构建时间；tauri 会自动先跑 beforeBuildCommand
+      #    （即 npm run build，生成嵌入 exe 的前端 dist）
+      # ---------------------------------------------------------------------
+      - name: Build Tauri release binary
+        run: npm run tauri build -- --no-bundle
+
+      # ---------------------------------------------------------------------
+      # 7. 定位并校验产物，输出诊断信息（便于失败排查）
+      # ---------------------------------------------------------------------
+      - name: Verify binary
+        run: |
+          $exe = "src-tauri/target/release/$env:APP_NAME.exe"
+          if (-not (Test-Path $exe)) {
+            throw "构建产物未找到: $exe —— 请检查构建步骤输出"
+          }
+          $mb = [math]::Round((Get-Item $exe).Length / 1MB, 2)
+          Write-Host "OK 构建产物: $exe ($mb MB)"
+
+      # ---------------------------------------------------------------------
+      # 8. 打包便携版 zip（绿色免安装）
+      #    文件名含版本号/分支名，如 house-combo-solver-v0.1.0-windows-x64.zip
+      #    若应用配置了外部资源目录，可在此一并加入：
+      #      Compress-Archive -Path "$exe", "src-tauri/target/release/resources" ...
+      # ---------------------------------------------------------------------
+      - name: Package portable zip
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          $ver = "${{ github.ref_name }}"
+          $exe = "src-tauri/target/release/$env:APP_NAME.exe"
+          $zip = "dist/$env:APP_NAME-$ver-windows-x64.zip"
+          Compress-Archive -Path $exe -DestinationPath $zip -Force
+          Write-Host "OK 便携包: $zip ($([math]::Round((Get-Item $zip).Length / 1MB, 2)) MB)"
+
+      # ---------------------------------------------------------------------
+      # 9. 上传到 GitHub Release（softprops/action-gh-release）
+      #    - 版本标签触发 → 上传到该标签的正式 Release（draft: false）
+      #    - main 分支触发 → 上传到 "continuous" 标签的预发布（draft: true，防误发）
+      #    - 手动触发（非标签）→ 同 main 分支行为
+      # ---------------------------------------------------------------------
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'continuous' }}
+          name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Continuous Build (main)' }}
+          body: |
+            ## 房源组合最优解计算器 — Windows 便携版
+
+            - 绿色免安装：解压后直接双击运行 `house-combo-solver.exe`
+            - 环境要求：Windows 10/11（内置 WebView2 运行时）
+            - 校验：exe 为 Rust (MSVC) 静态链接构建，无额外运行时依赖
+          draft: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          files: dist/*.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------------------------------------------------------------------
+      # 10. 失败诊断（仅当工作流失败时执行）
+      #     输出环境版本 + target 目录清单，配合 Actions 原生日志快速定位
+      # ---------------------------------------------------------------------
+      - name: Failure diagnostics
+        if: failure()
+        run: |
+          Write-Host "==== 环境信息 ===="
+          rustc -V; cargo -V; node -v; npm -v
+          Write-Host "==== target/release 目录清单 ===="
+          Get-ChildItem -Recurse "src-tauri/target/release" -ErrorAction SilentlyContinue `
+            | Select-Object FullName, Length | Select-Object -First 40
+          Write-Host "==== dist 目录清单 ===="
+          Get-ChildItem -Recurse dist -ErrorAction SilentlyContinue `
+            | Select-Object FullName, Length

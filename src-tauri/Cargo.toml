@@ -1,0 +1,23 @@
+[package]
+name = "house-combo-solver"
+version = "0.1.0"
+description = "房源组合最优解计算器 - Tauri Desktop App"
+authors = ["deng.ke"]
+edition = "2021"
+
+[lib]
+name = "house_combo_solver_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 整数线性规划求解器（纯 Rust minilp 后端，编译快、跨平台、无系统依赖）
+# 如需更高性能可切换为 features = ["cbc"]（需编译 CBC，体积大、耗时久）
+good_lp = { version = "1", default-features = false, features = ["minilp"] }
+
