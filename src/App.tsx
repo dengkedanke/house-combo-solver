@@ -3,6 +3,7 @@ import InputPanel from './components/InputPanel';
 import GridCanvas from './components/GridCanvas';
 import ResultPanel from './components/ResultPanel';
 import Sandglass from './components/Sandglass';
+import Logo from './components/Logo';
 import { useAppStore } from './store/useAppStore';
 
 export default function App() {
@@ -39,7 +40,7 @@ export default function App() {
     <div className="app">
       <header className="topbar">
         <div className="topbar-title">
-          <span className="logo-mark" />
+          <Logo size={24} />
           <h1>房源组合最优解计算器</h1>
         </div>
         <div className="topbar-actions">

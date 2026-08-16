@@ -721,3 +721,23 @@ body {
   background: #b5431f;
   border-color: #b5431f;
 }
+
+/* ---------- 左侧面板底部 footer ---------- */
+.panel-footer {
+  position: sticky;
+  bottom: -20px; /* 抵消 .input-panel 的 padding-bottom(20px)，贴住面板底边 */
+  margin: 16px -16px -20px; /* 抵消面板左右 padding，铺满面板宽度 */
+  padding: 9px 16px 10px;
+  background: var(--bg-panel);
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: #b9b7ae; /* 淡灰色 */
+  text-align: center;
+  letter-spacing: 0.3px;
+  user-select: none;
+}
+
+/* 顶栏 Logo 尺寸 */
+.topbar-title svg {
+  display: block;
+}

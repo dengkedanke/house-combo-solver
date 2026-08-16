@@ -252,6 +252,7 @@ export default function InputPanel() {
       <HouseTypeEditor />
       <CombinationEditor />
       <ManualInput />
+      <footer className="panel-footer">Vibed by DengKe with DS-V4-Flash</footer>
     </aside>
   );
 }
