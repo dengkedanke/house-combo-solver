@@ -2,13 +2,14 @@ import { create } from 'zustand';
 import type {
   AppConfig,
   Combination,
+  EnumerateResponse,
   HouseType,
   ManualInput,
   SolveRequest,
   SolveResult,
 } from '../types';
 import { invoke } from '../utils/tauri';
-import { jsSolve } from '../utils/jsSolver';
+import { jsSolve, jsEnumerate } from '../utils/jsSolver';
 import { uid } from '../utils/grid';
 
 // 带超时的 Rust 求解调用：超时或失败时降级到 JS 贪心算法，保证界面永不卡死
@@ -50,6 +51,23 @@ async function safeSolve(req: SolveRequest): Promise<SolveResult> {
   }
 }
 
+/** 遍历备选方案：优先 Rust ILP（精确），浏览器预览降级 JS（近似） */
+async function safeEnumerate(req: SolveRequest): Promise<EnumerateResponse> {
+  try {
+    // 枚举可能多轮求解，给更宽松的超时（30s）
+    const result = await withTimeout(
+      invoke<EnumerateResponse>('enumerate_solutions', { request: req }),
+      30000,
+    );
+    return result;
+  } catch (e) {
+    if (e instanceof Error && (e.message === 'NOT_IN_TAURI' || e.message === 'solve timeout')) {
+      return jsEnumerate(req);
+    }
+    throw e;
+  }
+}
+
 interface AppState {
   houseTypes: HouseType[];
   combinations: Combination[];
@@ -57,6 +75,14 @@ interface AppState {
   solveResult: SolveResult | null;
   calculating: boolean;
   rendering: boolean; // 网格渲染动画进行中
+  // 备选方案遍历
+  solutions: SolveResult[];
+  activeSolutionIndex: number | null;
+  enumerating: boolean;
+  /** 枚举是否因超时截断（未完整遍历） */
+  enumerateTruncated: boolean;
+  // "≥1"约束：勾选的组合数量下界为 1
+  minOneIds: string[];
   autoCalc: boolean;
   error: string | null;
   lastSolvedBy: 'rust' | 'js' | null;
@@ -75,11 +101,16 @@ interface AppState {
   // 手动输入
   setManualQuantity: (combinationId: string, quantity: number) => void;
   clearManual: () => void;
+  // "≥1"约束
+  toggleMinOne: (combinationId: string) => void;
 
   // 求解
   setAutoCalc: (v: boolean) => void;
   setRendering: (v: boolean) => void;
   solve: () => Promise<void>;
+  // 备选方案
+  enumerateSolutions: () => Promise<void>;
+  selectSolution: (index: number) => void;
 
   // 持久化
   saveConfig: () => Promise<void>;
@@ -91,11 +122,12 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set, get) => {
   const buildRequest = () => {
-    const { houseTypes, combinations, manualInputs } = get();
+    const { houseTypes, combinations, manualInputs, minOneIds } = get();
     return {
       houseTypes,
       combinations,
       manualInputs: manualInputs.filter((m) => m.quantity > 0),
+      minOneCombinationIds: minOneIds,
     };
   };
 
@@ -106,6 +138,11 @@ export const useAppStore = create<AppState>((set, get) => {
     solveResult: null,
     calculating: false,
     rendering: false,
+    solutions: [],
+    activeSolutionIndex: null,
+    enumerating: false,
+    enumerateTruncated: false,
+    minOneIds: [],
     autoCalc: true,
     error: null,
     lastSolvedBy: null,
@@ -151,6 +188,7 @@ export const useAppStore = create<AppState>((set, get) => {
       set((s) => ({
         combinations: s.combinations.filter((c) => c.id !== id),
         manualInputs: s.manualInputs.filter((m) => m.combinationId !== id),
+        minOneIds: s.minOneIds.filter((x) => x !== id),
       })),
 
     setCombinationItem: (comboId, typeId, count) =>
@@ -173,11 +211,23 @@ export const useAppStore = create<AppState>((set, get) => {
     setManualQuantity: (combinationId, quantity) =>
       set((s) => {
         const others = s.manualInputs.filter((m) => m.combinationId !== combinationId);
-        if (quantity <= 0) return { manualInputs: others };
-        return { manualInputs: [...others, { combinationId, quantity }] };
+        // M1 修复：手动指定数量后，"≥1"下界约束无意义，自动取消勾选（状态自洽）
+        const minOneIds =
+          quantity > 0
+            ? s.minOneIds.filter((id) => id !== combinationId)
+            : s.minOneIds;
+        if (quantity <= 0) return { manualInputs: others, minOneIds };
+        return { manualInputs: [...others, { combinationId, quantity }], minOneIds };
       }),
 
     clearManual: () => set({ manualInputs: [] }),
+
+    toggleMinOne: (combinationId) =>
+      set((s) => ({
+        minOneIds: s.minOneIds.includes(combinationId)
+          ? s.minOneIds.filter((id) => id !== combinationId)
+          : [...s.minOneIds, combinationId],
+      })),
 
     setAutoCalc: (v) => set({ autoCalc: v }),
     setRendering: (v) => set({ rendering: v }),
@@ -189,7 +239,14 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ solveResult: null, calculating: false });
         return;
       }
-      set({ calculating: true, error: null });
+      // 输入变化后旧的备选方案已失效，清空（避免展示过期数据）
+      set({
+        calculating: true,
+        error: null,
+        solutions: [],
+        activeSolutionIndex: null,
+        enumerateTruncated: false,
+      });
       try {
         const result = await safeSolve(req);
         set({
@@ -201,6 +258,33 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ calculating: false, error: String(e) });
       }
     },
+
+    enumerateSolutions: async () => {
+      const req = buildRequest();
+      if (req.houseTypes.length === 0 || req.combinations.length === 0) {
+        set({ error: '请先添加房源类型和组合', enumerating: false });
+        return;
+      }
+      set({ enumerating: true, error: null });
+      try {
+        const resp = await safeEnumerate(req);
+        set({
+          solutions: resp.solutions,
+          activeSolutionIndex: resp.solutions.length > 0 ? 0 : null,
+          enumerateTruncated: resp.truncated,
+          enumerating: false,
+        });
+        // 首次即无可行解：明确提示且不生成标签
+        if (resp.solutions.length === 0) {
+          set({ error: '未找到可行方案' });
+        }
+      } catch (e) {
+        // 异常时保留已保存的方案，仅提示错误
+        set({ enumerating: false, error: String(e) });
+      }
+    },
+
+    selectSolution: (index) => set({ activeSolutionIndex: index }),
 
     saveConfig: async () => {
       const { houseTypes, combinations } = get();
@@ -264,6 +348,9 @@ export const useAppStore = create<AppState>((set, get) => {
           },
         ],
         manualInputs: [{ combinationId: 'cA', quantity: 5 }],
+        minOneIds: [],
+        solutions: [],
+        activeSolutionIndex: null,
         solveResult: null,
         error: null,
       }),

@@ -87,6 +87,13 @@ export default function GridCanvas() {
   const solveResult = useAppStore((s) => s.solveResult);
   const lastSolvedBy = useAppStore((s) => s.lastSolvedBy);
   const setRendering = useAppStore((s) => s.setRendering);
+  // 备选方案：选中方案时网格展示该方案的占用分布
+  const solutions = useAppStore((s) => s.solutions);
+  const activeSolutionIndex = useAppStore((s) => s.activeSolutionIndex);
+  const result =
+    activeSolutionIndex !== null && solutions[activeSolutionIndex]
+      ? solutions[activeSolutionIndex]
+      : solveResult;
 
   const containerRef = useRef<HTMLDivElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -100,8 +107,8 @@ export default function GridCanvas() {
     [houseTypes],
   );
   const cells = useMemo(
-    () => buildCells(houseTypes, combinations, solveResult),
-    [houseTypes, combinations, solveResult],
+    () => buildCells(houseTypes, combinations, result),
+    [houseTypes, combinations, result],
   );
 
   // 自适应容器尺寸

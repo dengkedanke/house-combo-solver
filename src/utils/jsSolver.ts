@@ -1,6 +1,6 @@
 // 浏览器环境的降级求解器（贪心算法），用于 vite dev 无 Tauri 时预览。
 // 生产环境由 Rust 后端 ILP 求解器提供精确解。
-import type { SolveRequest, SolveResult } from '../types';
+import type { EnumerateResponse, SolveRequest, SolveResult } from '../types';
 
 function solveGreedyOneOrder(
   usage: number[][],
@@ -46,11 +46,12 @@ function gcd(a: number, b: number): number {
 }
 
 // 均衡化后处理（与 Rust balance_solution 一致）：
-// 保持总套数（最优值）不变，通过"总量守恒转移"使组合数量方差最小
+// 保持总套数（最优值）不变，通过"总量守恒转移"使组合数量方差最小；尊重 lower 下界
 function balanceSolution(
   usage: number[][],
   remaining: number[],
   totals: number[],
+  lower: number[],
   xs: number[],
 ): void {
   const n = xs.length;
@@ -69,6 +70,8 @@ function balanceSolution(
         if (g > xs[a]) continue;
         const newXa = xs[a] - g;
         const newXb = xs[b] + h;
+        // 下界保护：转移后不得低于"≥1"等数量下界
+        if (newXa < (lower[a] ?? 0)) continue;
         // 校验新解不违反任何户型库存约束
         let feasible = true;
         for (let j = 0; j < remaining.length; j++) {
@@ -131,9 +134,24 @@ export function jsSolve(req: SolveRequest): SolveResult {
     return Math.max(0, t.quantity - used);
   });
 
-  // 自由组合贪心
+  // 自由组合贪心（尊重"≥1"下界：先预分配下界，再对剩余库存贪心）
   const freeIdx = req.combinations.map((_, i) => i).filter((i) => !manual[i]);
   const freeUsage = freeIdx.map((k) => usage[k]);
+  // 自由组合下界（勾选 ≥1 的组合为 1）
+  const lower = freeIdx.map((gi) =>
+    req.minOneCombinationIds?.includes(req.combinations[gi].id) ? 1 : 0,
+  );
+  // 预分配下界并扣减库存
+  const lowerXs = new Array(freeIdx.length).fill(0);
+  const remAfterLower = [...remaining];
+  freeIdx.forEach((_, i) => {
+    if (lower[i] > 0) {
+      for (let j = 0; j < remAfterLower.length; j++) {
+        remAfterLower[j] -= freeUsage[i][j] * lower[i];
+      }
+      lowerXs[i] = lower[i];
+    }
+  });
 
   let best = { xs: freeIdx.map(() => 0), used: 0, variance: Infinity };
   if (freeIdx.length > 0) {
@@ -158,24 +176,45 @@ export function jsSolve(req: SolveRequest): SolveResult {
       }),
     );
     for (const order of orders) {
-      const r = solveGreedyOneOrder(freeUsage, remaining, order.map((k) => pos.get(k)!));
-      const variance = xsVariance(r.xs);
+      const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!));
+      // 叠加下界预分配
+      const full = r.xs.map((x, i) => x + lowerXs[i]);
+      const variance = xsVariance(full);
+      const used = full.reduce((acc, x, i) => acc + x * totals[i], 0);
       // 平局时优先方差小（组合数量更均衡），消除"先定义组合优先"偏见
-      if (r.used > best.used || (r.used === best.used && variance < best.variance)) {
-        best = { xs: r.xs, used: r.used, variance };
+      if (used > best.used || (used === best.used && variance < best.variance)) {
+        best = { xs: full, used, variance };
       }
     }
     freeIdx.forEach((k, i) => {
       xs[k] = best.xs[i];
     });
-    // 公平性：保持总套数不变，均衡各组合数量（方差最小）
-    balanceSolution(freeUsage, remaining, totals, best.xs);
+    // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界）
+    balanceSolution(freeUsage, remAfterLower, totals, lower, best.xs);
     freeIdx.forEach((k, i) => {
       xs[k] = best.xs[i];
     });
   }
 
-  // 组装结果
+  return buildSolveResult(
+    req,
+    usage,
+    xs,
+    manual,
+    freeIdx.length === 0 ? 'manual-only' : 'greedy (preview)',
+    Math.round(performance.now() - start),
+  );
+}
+
+/** 组装 SolveResult（jsSolve 与 jsEnumerate 共用） */
+function buildSolveResult(
+  req: SolveRequest,
+  usage: number[][],
+  xs: number[],
+  manual: boolean[],
+  algorithm: string,
+  solveTimeMs: number,
+): SolveResult {
   const assignments = req.combinations
     .map((c, k) => ({
       combinationId: c.id,
@@ -204,7 +243,139 @@ export function jsSolve(req: SolveRequest): SolveResult {
     remaining: remainingItems,
     totalUsed,
     totalRemaining,
-    solveTimeMs: Math.round(performance.now() - start),
-    algorithm: freeIdx.length === 0 ? 'manual-only' : 'greedy (preview)',
+    solveTimeMs,
+    algorithm,
   };
+}
+
+/**
+ * 浏览器预览降级：遍历备选方案（近似实现）
+ * 桌面版由 Rust ILP + no-good cut 精确遍历；此处用"多策略贪心 + 自由组合子集变体"
+ * 生成互不相同的方案，供浏览器预览体验。
+ */
+export function jsEnumerate(req: SolveRequest, max = 50): EnumerateResponse {
+  const typeIds = req.houseTypes.map((t) => t.id);
+  const typeIdx = new Map(typeIds.map((id, i) => [id, i]));
+  const usage = req.combinations.map((c) => {
+    const row = new Array(typeIds.length).fill(0);
+    for (const item of c.items) {
+      const j = typeIdx.get(item.typeId);
+      if (j !== undefined) row[j] = item.count;
+    }
+    return row;
+  });
+
+  const comboIdx = new Map(req.combinations.map((c, i) => [c.id, i]));
+  const manual = new Array(req.combinations.length).fill(false);
+  const manualQs = new Array(req.combinations.length).fill(0);
+  for (const mi of req.manualInputs) {
+    const k = comboIdx.get(mi.combinationId);
+    if (k !== undefined) {
+      manualQs[k] = mi.quantity;
+      manual[k] = true;
+    }
+  }
+  const freeIdx = req.combinations.map((_, i) => i).filter((i) => !manual[i]);
+  if (freeIdx.length === 0) {
+    // 全手动 → 仅一种方案（预览近似，无截断）
+    return { solutions: [jsSolve(req)], truncated: false };
+  }
+
+  const freeUsage = freeIdx.map((k) => usage[k]);
+  const remaining = req.houseTypes.map((t, j) => {
+    let used = 0;
+    usage.forEach((row, k) => {
+      used += manualQs[k] * row[j];
+    });
+    return Math.max(0, t.quantity - used);
+  });
+  const pos = new Map(freeIdx.map((k, i) => [k, i]));
+  const totals = freeUsage.map((u) => u.reduce((s, c) => s + c, 0));
+
+  // "≥1"下界：预分配下界组合，剩余库存供贪心/子集变体使用
+  const lower = freeIdx.map((gi) =>
+    req.minOneCombinationIds?.includes(req.combinations[gi].id) ? 1 : 0,
+  );
+  const lowerXs = new Array(freeIdx.length).fill(0);
+  const remAfterLower = [...remaining];
+  freeIdx.forEach((_, i) => {
+    if (lower[i] > 0) {
+      for (let j = 0; j < remAfterLower.length; j++) {
+        remAfterLower[j] -= freeUsage[i][j];
+      }
+      lowerXs[i] = 1;
+    }
+  });
+  // 非下界自由组合（子集变体只在这些组合上枚举，保证下界始终满足）
+  const freeNonLower = freeIdx.filter((_, i) => lower[i] === 0);
+
+  const seen = new Set<string>();
+  const results: SolveResult[] = [];
+  const start = performance.now();
+
+  const trySolution = (freeXs: number[]) => {
+    const k = freeXs.join(',');
+    if (seen.has(k)) return;
+    seen.add(k);
+    // 自由组合全 0 且无手动输入 → 无可行正解，跳过（不生成空方案标签）
+    if (freeXs.every((x) => x === 0) && manualQs.every((q) => q === 0)) return;
+    const full = new Array(req.combinations.length).fill(0);
+    freeIdx.forEach((gi, i) => {
+      full[gi] = freeXs[i];
+    });
+    manual.forEach((m, gi) => {
+      if (m) full[gi] = manualQs[gi];
+    });
+    results.push(
+      buildSolveResult(
+        req,
+        usage,
+        full,
+        manual,
+        'greedy (预览枚举)',
+        Math.round(performance.now() - start),
+      ),
+    );
+  };
+
+  // 1) 多策略贪心解（叠加下界预分配）
+  const orders: number[][] = [];
+  orders.push([...freeIdx].sort((a, b) => totals[pos.get(b)!] - totals[pos.get(a)!] || a - b));
+  orders.push([...freeIdx].sort((a, b) => totals[pos.get(a)!] - totals[pos.get(b)!] || a - b));
+  orders.push([...freeIdx]);
+  orders.push(
+    [...freeIdx].sort((a, b) => {
+      const ia = pos.get(a)!;
+      const ib = pos.get(b)!;
+      const cntA = freeUsage[ia].filter((c) => c > 0).length || 1;
+      const cntB = freeUsage[ib].filter((c) => c > 0).length || 1;
+      return totals[ia] / cntA - totals[ib] / cntB || a - b;
+    }),
+  );
+  for (const order of orders) {
+    const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!));
+    trySolution(r.xs.map((x, i) => x + lowerXs[i]));
+    if (results.length >= max) return { solutions: results, truncated: false };
+  }
+
+  // 2) 非下界自由组合子集变体（组合数 ≤ 6 时枚举所有非空子集，生成更多备选）
+  if (freeNonLower.length <= 6) {
+    for (let mask = 1; mask < 1 << freeNonLower.length && results.length < max; mask++) {
+      const subset = freeNonLower.filter((_, i) => (mask & (1 << i)) !== 0);
+      const subUsage = subset.map((k) => usage[k]);
+      const r = solveGreedyOneOrder(
+        subUsage,
+        [...remAfterLower],
+        subset.map((_, i) => i),
+      );
+      const fullSub = lowerXs.slice(); // 下界预分配 + 子集贪心
+      // r.xs 按下标顺序对应 subset
+      subset.forEach((gi, si) => {
+        fullSub[pos.get(gi)!] = lowerXs[pos.get(gi)!] + r.xs[si];
+      });
+      trySolution(fullSub);
+    }
+  }
+
+  return { solutions: results, truncated: false };
 }

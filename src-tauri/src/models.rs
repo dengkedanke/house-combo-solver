@@ -42,6 +42,9 @@ pub struct SolveRequest {
     pub house_types: Vec<HouseType>,
     pub combinations: Vec<Combination>,
     pub manual_inputs: Vec<ManualInput>,
+    /// 勾选"≥1"的组合 id：这些组合在求解中的数量下界为 1（必须纳入计算）
+    #[serde(default)]
+    pub min_one_combination_ids: Vec<String>,
 }
 
 /// 单个组合的分配结果
@@ -73,4 +76,13 @@ pub struct SolveResult {
     pub total_remaining: u32,
     pub solve_time_ms: u64,
     pub algorithm: String,
+}
+
+/// 备选方案遍历结果
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct EnumerateResponse {
+    pub solutions: Vec<SolveResult>,
+    /// 是否因超时截断（true 表示未完整遍历所有方案）
+    pub truncated: bool,
 }

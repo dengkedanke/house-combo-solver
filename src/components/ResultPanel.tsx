@@ -7,25 +7,69 @@ export default function ResultPanel() {
   const houseTypes = useAppStore((s) => s.houseTypes);
   const combinations = useAppStore((s) => s.combinations);
   const solving = useAppStore((s) => s.calculating);
+  // 备选方案
+  const solutions = useAppStore((s) => s.solutions);
+  const activeSolutionIndex = useAppStore((s) => s.activeSolutionIndex);
+  const enumerating = useAppStore((s) => s.enumerating);
+  const selectSolution = useAppStore((s) => s.selectSolution);
+  const enumerateTruncated = useAppStore((s) => s.enumerateTruncated);
+  // "≥1"约束（结果中标注该组合数量最小值为 1）
+  const minOneIds = useAppStore((s) => s.minOneIds);
 
-  if (!solveResult) {
+  // 优先展示当前选中的备选方案；否则展示单次计算结果
+  const result =
+    activeSolutionIndex !== null && solutions[activeSolutionIndex]
+      ? solutions[activeSolutionIndex]
+      : solveResult;
+
+  if (!result) {
     return (
       <aside className="result-panel">
         <h2>计算结果</h2>
         <div className="result-empty">
-          {solving ? '计算中…' : '暂无结果，点击"计算最优解"'}
+          {enumerating
+            ? '正在遍历备选方案…'
+            : solving
+              ? '计算中…'
+              : '暂无结果，点击"计算最优解"'}
         </div>
       </aside>
     );
   }
 
-  const result = solveResult;
+  const hasPlans = solutions.length > 0;
+  const planLabel =
+    activeSolutionIndex !== null ? `方案 ${activeSolutionIndex + 1}` : null;
 
   return (
     <aside className="result-panel">
       <div className="section-header">
         <h2>计算结果</h2>
+        {planLabel && <span className="tag-plan">{planLabel}</span>}
       </div>
+
+      {/* 备选方案标签栏：点击切换，选中高亮；方案多时竖向滚动 */}
+      {hasPlans && (
+        <>
+          <div className="solution-tabs" role="tablist" aria-label="备选方案">
+            {solutions.map((_, i) => (
+              <button
+                key={i}
+                role="tab"
+                aria-selected={i === activeSolutionIndex}
+                className={`solution-tab ${i === activeSolutionIndex ? 'active' : ''}`}
+                onClick={() => selectSolution(i)}
+              >
+                方案{i + 1}
+              </button>
+            ))}
+          </div>
+          {/* E2：超时截断提示——区分"已穷尽"与"仅部分方案" */}
+          {enumerateTruncated && (
+            <p className="enumerate-truncated">已截断：求解超时，仅显示部分方案</p>
+          )}
+        </>
+      )}
 
       <div className="metric-grid">
         <div className="metric-card">
@@ -53,6 +97,7 @@ export default function ResultPanel() {
                 <span className="result-qty">{a.quantity}</span>
                 <span className="muted">个</span>
                 {a.isManual && <span className="tag-manual">手动</span>}
+                {minOneIds.includes(a.combinationId) && <span className="tag-minone">≥1</span>}
               </li>
             );
           })}

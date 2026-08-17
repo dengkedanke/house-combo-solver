@@ -27,6 +27,8 @@ export interface SolveRequest {
   houseTypes: HouseType[];
   combinations: Combination[];
   manualInputs: ManualInput[];
+  /** 勾选"≥1"的组合 id：这些组合在求解中的数量下界为 1（必须纳入计算） */
+  minOneCombinationIds: string[];
 }
 
 export interface CombinationAssignment {
@@ -49,6 +51,13 @@ export interface SolveResult {
   totalRemaining: number;
   solveTimeMs: number;
   algorithm: string;
+}
+
+/** 备选方案遍历结果 */
+export interface EnumerateResponse {
+  solutions: SolveResult[];
+  /** 是否因超时截断（true 表示未完整遍历所有方案） */
+  truncated: boolean;
 }
 
 // 持久化配置

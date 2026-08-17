@@ -196,6 +196,10 @@ function ManualInput() {
   const clearManual = useAppStore((s) => s.clearManual);
   const solve = useAppStore((s) => s.solve);
   const calculating = useAppStore((s) => s.calculating);
+  const enumerateSolutions = useAppStore((s) => s.enumerateSolutions);
+  const enumerating = useAppStore((s) => s.enumerating);
+  const minOneIds = useAppStore((s) => s.minOneIds);
+  const toggleMinOne = useAppStore((s) => s.toggleMinOne);
   const hasManual = manualInputs.some((m) => m.quantity > 0);
 
   return (
@@ -214,10 +218,33 @@ function ManualInput() {
       <div className="manual-list">
         {combinations.map((c, idx) => {
           const v = manualInputs.find((m) => m.combinationId === c.id)?.quantity ?? 0;
+          const isEmpty = c.items.length === 0; // 空组合无法分配 ≥1，禁用勾选
+          const isManual = v > 0; // 手动指定后 ≥1 无意义（数量已固定且 ≥1），禁用勾选
+          const checked = minOneIds.includes(c.id) && !isManual;
+          const disabled = isEmpty || isManual;
           return (
             <label key={c.id} className="manual-row">
               <span className="color-dot" style={{ background: getCombinationColor(idx) }} />
               <span className="manual-name">{c.name}</span>
+              {/* "≥1"下界约束：勾选后该组合数量不得为 0 */}
+              <label
+                className={`min-one ${disabled ? 'disabled' : ''}`}
+                title={
+                  isEmpty
+                    ? '组合未包含房源，无法设置 ≥1'
+                    : isManual
+                      ? '已手动指定数量，无需设置 ≥1'
+                      : '勾选后该组合数量最小值为 1'
+                }
+              >
+                <input
+                  type="checkbox"
+                  checked={checked}
+                  disabled={disabled}
+                  onChange={() => toggleMinOne(c.id)}
+                />
+                <span>≥1</span>
+              </label>
               <input
                 type="number"
                 min={0}
@@ -234,6 +261,15 @@ function ManualInput() {
 
       <button className="btn btn-primary btn-block" onClick={() => solve()} disabled={calculating}>
         {calculating ? '计算中…' : '计算最优解'}
+      </button>
+
+      <button
+        className="btn btn-block btn-enumerate"
+        onClick={() => enumerateSolutions()}
+        disabled={enumerating || calculating}
+        title="循环 ILP 求解，生成多个互不相同的备选方案"
+      >
+        {enumerating ? '遍历中…' : '遍历备选方案'}
       </button>
     </section>
   );
