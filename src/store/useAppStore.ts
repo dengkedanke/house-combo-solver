@@ -95,6 +95,8 @@ interface AppState {
   // 组合操作
   addCombination: (name: string, items: { typeId: string; count: number }[]) => void;
   updateCombination: (id: string, patch: Partial<Combination>) => void;
+  /** 更新组合权重偏好（1-10） */
+  updateComboWeight: (comboId: string, weight: number) => void;
   removeCombination: (id: string) => void;
   setCombinationItem: (comboId: string, typeId: string, count: number) => void;
 
@@ -175,6 +177,7 @@ export const useAppStore = create<AppState>((set, get) => {
             id: uid('c'),
             name: name || `组合${String.fromCharCode(65 + s.combinations.length)}`,
             items: items.map((i) => ({ ...i })),
+            weight: 5,
           },
         ],
       })),
@@ -182,6 +185,13 @@ export const useAppStore = create<AppState>((set, get) => {
     updateCombination: (id, patch) =>
       set((s) => ({
         combinations: s.combinations.map((c) => (c.id === id ? { ...c, ...patch } : c)),
+      })),
+
+    updateComboWeight: (comboId, weight) =>
+      set((s) => ({
+        combinations: s.combinations.map((c) =>
+          c.id === comboId ? { ...c, weight: Math.min(10, Math.max(1, Math.round(weight))) } : c,
+        ),
       })),
 
     removeCombination: (id) =>
@@ -249,10 +259,15 @@ export const useAppStore = create<AppState>((set, get) => {
       });
       try {
         const result = await safeSolve(req);
+        // 判定求解引擎：JS 预览（algorithm 含 'preview'）或 JS 超时降级（含 '超时降级'，
+        // 仅 JS 路径会追加该标记）均归为 'js'；Rust ILP / Rust 贪心兜底归为 'rust'。
+        // 注意：不能仅凭 'greedy' 判定，否则会把 Rust 原生贪心兜底误判为 JS。
+        const isJs =
+          result.algorithm.includes('preview') || result.algorithm.includes('超时降级');
         set({
           solveResult: result,
           calculating: false,
-          lastSolvedBy: result.algorithm.includes('preview') ? 'js' : 'rust',
+          lastSolvedBy: isJs ? 'js' : 'rust',
         });
       } catch (e) {
         set({ calculating: false, error: String(e) });
@@ -324,6 +339,7 @@ export const useAppStore = create<AppState>((set, get) => {
           {
             id: 'cA',
             name: '组合A',
+            weight: 5,
             items: [
               { typeId: 't50', count: 1 },
               { typeId: 't70', count: 2 },
@@ -333,6 +349,7 @@ export const useAppStore = create<AppState>((set, get) => {
           {
             id: 'cB',
             name: '组合B',
+            weight: 5,
             items: [
               { typeId: 't120', count: 1 },
               { typeId: 't150', count: 1 },
@@ -341,6 +358,7 @@ export const useAppStore = create<AppState>((set, get) => {
           {
             id: 'cC',
             name: '组合C',
+            weight: 5,
             items: [
               { typeId: 't70', count: 1 },
               { typeId: 't90', count: 2 },

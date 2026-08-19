@@ -42,7 +42,19 @@ pub fn solve_ilp_with_cuts(
     lower: &[u32],
     cuts: &[Cut],
 ) -> Option<Vec<u32>> {
-    match solve_ilp_detailed(usage, remaining, lower, cuts, ILP_TIMEOUT_MS) {
+    solve_ilp_with_cuts_weighted(usage, remaining, lower, &[], cuts)
+}
+
+/// 带权重偏好的两阶段求解（solve_ilp_with_cuts + weights）。
+/// weights[k]：组合 k 的权重（1-10），仅影响阶段二的加权目标，不影响利用率最大化。
+pub fn solve_ilp_with_cuts_weighted(
+    usage: &[Vec<u32>],
+    remaining: &[u32],
+    lower: &[u32],
+    weights: &[u8],
+    cuts: &[Cut],
+) -> Option<Vec<u32>> {
+    match solve_ilp_detailed(usage, remaining, lower, weights, cuts, ILP_TIMEOUT_MS) {
         IlpOutcome::Solved(v) => Some(v),
         _ => None,
     }
@@ -55,6 +67,7 @@ pub fn solve_ilp_detailed(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    weights: &[u8],
     cuts: &[Cut],
     timeout_ms: u64,
 ) -> IlpOutcome {
@@ -63,9 +76,15 @@ pub fn solve_ilp_detailed(
         return IlpOutcome::Solved(vec![]);
     }
 
-    // 组合数量过多时 minilp 分支定界可能变慢，直接交由贪心处理
+    // 组合数量过多时 minilp 分支定界可能变慢：返回 TimedOut 而非 Infeasible。
+    // 语义区别（P1-3 修复）：
+    // - 单方案求解：TimedOut 与 Infeasible 都会被 solve_ilp_with_cuts_weighted
+    //   映射为 None，从而降级到贪心，行为不变；
+    // - 枚举流程：Infeasible 被解释为"已穷尽所有方案"（提前结束），
+    //   而 TimedOut 被解释为"超时截断"（置 truncated=true），
+    //   避免把"算不动"误判为"已遍历完"，导致漏掉真实存在的方案。
     if n > 60 {
-        return IlpOutcome::Infeasible;
+        return IlpOutcome::TimedOut;
     }
 
     // 放入线程执行并限时：超时返回 TimedOut（调用方决定降级/截断），
@@ -74,9 +93,16 @@ pub fn solve_ilp_detailed(
     let usage_owned = usage.to_vec();
     let remaining_owned = remaining.to_vec();
     let lower_owned = lower.to_vec();
+    let weights_owned = weights.to_vec();
     let cuts_owned = cuts.to_vec();
     std::thread::spawn(move || {
-        let result = solve_ilp_inner(&usage_owned, &remaining_owned, &lower_owned, &cuts_owned);
+        let result = solve_ilp_inner(
+            &usage_owned,
+            &remaining_owned,
+            &lower_owned,
+            &cuts_owned,
+            &weights_owned,
+        );
         let _ = tx.send(result);
     });
 
@@ -92,63 +118,129 @@ fn solve_ilp_inner(
     remaining: &[u32],
     lower: &[u32],
     cuts: &[Cut],
+    weights: &[u8],
 ) -> Option<Vec<u32>> {
     let n = usage.len();
     let m = remaining.len();
-    let mut vars = variables!();
-    // 变量下界：x_k ≥ lower[k]（如"≥1"约束）
-    let xs: Vec<Variable> = (0..n)
-        .map(|k| vars.add(variable().min(lower.get(k).copied().unwrap_or(0) as f64).integer()))
-        .collect();
 
-    // 目标函数：最大化 Σ(x_k × 组合k的总套数)
-    let mut objective = Expression::default();
-    for (k, x) in xs.iter().enumerate() {
+    // ---------- 阶段一：最大化利用率 ----------
+    // 在库存 + 下界 + no-good cut 约束下，最大化已分配总套数 maxUtil
+    let mut vars1 = variables!();
+    let xs1: Vec<Variable> = (0..n)
+        .map(|k| vars1.add(variable().min(lower.get(k).copied().unwrap_or(0) as f64).integer()))
+        .collect();
+    let mut objective1 = Expression::default();
+    for (k, x) in xs1.iter().enumerate() {
         let total_units = usage[k].iter().sum::<u32>() as f64;
         if total_units > 0.0 {
-            objective += total_units * (*x);
+            objective1 += total_units * (*x);
         }
     }
-
-    let mut model = vars.maximise(objective).using(default_solver);
-
-    // 约束：每种户型的消耗不超过剩余库存
+    let mut model1 = vars1.maximise(objective1).using(default_solver);
+    // 库存约束
     for j in 0..m {
         let mut expr = Expression::default();
-        for (k, x) in xs.iter().enumerate() {
+        for (k, x) in xs1.iter().enumerate() {
             let c = usage[k][j] as f64;
             if c > 0.0 {
                 expr += c * (*x);
             }
         }
         if expr != Expression::default() {
-            model = model.with(constraint!(expr <= remaining[j] as f64));
+            model1 = model1.with(constraint!(expr <= remaining[j] as f64));
         }
     }
-
-    // 增量约束（no-good cuts）：屏蔽已求得的方案
+    // no-good cuts
     for cut in cuts {
         let mut expr = Expression::default();
-        for (k, x) in xs.iter().enumerate() {
+        for (k, x) in xs1.iter().enumerate() {
             let c = cut.coeffs.get(k).copied().unwrap_or(0) as f64;
             if c != 0.0 {
                 expr += c * (*x);
             }
         }
         if expr != Expression::default() {
-            model = model.with(constraint!(expr <= cut.rhs as f64));
+            model1 = model1.with(constraint!(expr <= cut.rhs as f64));
         }
     }
+    let solution1 = model1.solve().ok()?;
+    // 最大利用率
+    let max_util: f64 = (0..n)
+        .map(|k| solution1.value(xs1[k]).max(0.0) * usage[k].iter().sum::<u32>() as f64)
+        .sum();
+    if max_util <= 0.0 {
+        // 无可分配方案：返回全 0（上层据此判定无解/空方案）
+        return Some(vec![0u32; n]);
+    }
 
-    match model.solve() {
-        Ok(solution) => {
-            let vals: Vec<u32> = xs
+    // ---------- 阶段二：加权偏好优化（分层优化） ----------
+    // 硬约束：已分配总套数 ≥ 阶段一的最大利用率（绝对不牺牲"用完房源"）
+    // 目标：最大化 Σ (weightCoeff_k × 组合总套数_k × x_k)
+    // weightCoeff = 1.0 + (weight - 1) * 0.001 —— 1~10 只带来 0~0.9% 微小差异
+    let mut vars2 = variables!();
+    let xs2: Vec<Variable> = (0..n)
+        .map(|k| vars2.add(variable().min(lower.get(k).copied().unwrap_or(0) as f64).integer()))
+        .collect();
+    let utilized = vars2.add(variable().min(0.0));
+
+    let mut objective2 = Expression::default();
+    let mut util_expr = Expression::default();
+    for (k, x) in xs2.iter().enumerate() {
+        let total_units = usage[k].iter().sum::<u32>() as f64;
+        if total_units > 0.0 {
+            let w = weights.get(k).copied().unwrap_or(5) as f64;
+            let coeff = 1.0 + (w - 1.0) * 0.001;
+            objective2 += (coeff * total_units) * (*x);
+            util_expr += total_units * (*x);
+        }
+    }
+    let mut model2 = vars2.maximise(objective2).using(default_solver);
+    // 库存约束（同阶段一）
+    for j in 0..m {
+        let mut expr = Expression::default();
+        for (k, x) in xs2.iter().enumerate() {
+            let c = usage[k][j] as f64;
+            if c > 0.0 {
+                expr += c * (*x);
+            }
+        }
+        if expr != Expression::default() {
+            model2 = model2.with(constraint!(expr <= remaining[j] as f64));
+        }
+    }
+    // no-good cuts
+    for cut in cuts {
+        let mut expr = Expression::default();
+        for (k, x) in xs2.iter().enumerate() {
+            let c = cut.coeffs.get(k).copied().unwrap_or(0) as f64;
+            if c != 0.0 {
+                expr += c * (*x);
+            }
+        }
+        if expr != Expression::default() {
+            model2 = model2.with(constraint!(expr <= cut.rhs as f64));
+        }
+    }
+    // 利用率定义与硬约束：utilized == Σ(总套数×x) 且 utilized ≥ max_util
+    model2 = model2.with(constraint!(util_expr - utilized == 0.0));
+    model2 = model2.with(constraint!(utilized >= max_util));
+
+    match model2.solve() {
+        Ok(solution2) => {
+            let vals: Vec<u32> = xs2
                 .iter()
-                .map(|x| solution.value(*x).max(0.0).round() as u32)
+                .map(|x| solution2.value(*x).max(0.0).round() as u32)
                 .collect();
             Some(vals)
         }
-        Err(_) => None,
+        // 阶段二异常（浮点精度等）：回退阶段一解，保证至少给出最优利用率方案
+        Err(_) => {
+            let vals: Vec<u32> = xs1
+                .iter()
+                .map(|x| solution1.value(*x).max(0.0).round() as u32)
+                .collect();
+            Some(vals)
+        }
     }
 }
 

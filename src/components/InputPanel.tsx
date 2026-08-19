@@ -188,6 +188,41 @@ function CombinationEditor() {
   );
 }
 
+/* ---------- 组合权重偏好（分层优化阶段二） ---------- */
+function WeightPreference() {
+  const combinations = useAppStore((s) => s.combinations);
+  const updateComboWeight = useAppStore((s) => s.updateComboWeight);
+
+  if (combinations.length === 0) return null;
+
+  return (
+    <section className="panel-section">
+      <div className="section-header">
+        <h3>偏好设置</h3>
+      </div>
+      <div className="weight-list">
+        {combinations.map((c, idx) => (
+          <label key={c.id} className="weight-row">
+            <span className="color-dot" style={{ background: getCombinationColor(idx) }} />
+            <span className="weight-name">{c.name}</span>
+            <input
+              type="range"
+              min={1}
+              max={10}
+              step={1}
+              value={c.weight ?? 5}
+              onChange={(e) => updateComboWeight(c.id, Number(e.target.value))}
+              className="weight-slider"
+            />
+            <span className="weight-value">{c.weight ?? 5}</span>
+          </label>
+        ))}
+      </div>
+      <p className="weight-hint">💡 权重越高，算法越优先使用该组合（不影响"用完房源"的最终目标）</p>
+    </section>
+  );
+}
+
 /* ---------- 手动输入 ---------- */
 function ManualInput() {
   const combinations = useAppStore((s) => s.combinations);
@@ -287,6 +322,7 @@ export default function InputPanel() {
       </div>
       <HouseTypeEditor />
       <CombinationEditor />
+      <WeightPreference />
       <ManualInput />
       <footer className="panel-footer">Vibed by DengKe with DS-V4-Flash</footer>
     </aside>

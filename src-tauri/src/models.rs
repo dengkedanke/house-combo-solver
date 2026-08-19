@@ -25,6 +25,13 @@ pub struct Combination {
     pub name: String,
     pub color: Option<String>,
     pub items: Vec<CombinationItem>,
+    /// 组合权重偏好（1-10，默认 5）。分层优化阶段二在保持最大利用率下优先高权重组合。
+    #[serde(default = "default_weight")]
+    pub weight: u8,
+}
+
+fn default_weight() -> u8 {
+    5
 }
 
 /// 手动输入：某个组合指定数量

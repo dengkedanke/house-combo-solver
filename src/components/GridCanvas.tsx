@@ -85,7 +85,6 @@ export default function GridCanvas() {
   const houseTypes = useAppStore((s) => s.houseTypes);
   const combinations = useAppStore((s) => s.combinations);
   const solveResult = useAppStore((s) => s.solveResult);
-  const lastSolvedBy = useAppStore((s) => s.lastSolvedBy);
   const setRendering = useAppStore((s) => s.setRendering);
   // 备选方案：选中方案时网格展示该方案的占用分布
   const solutions = useAppStore((s) => s.solutions);
@@ -271,6 +270,15 @@ export default function GridCanvas() {
     drawFinal();
   };
 
+  // 方案 A：从当前展示方案 result 的 algorithm 字段动态推断求解来源，
+  // 无论单方案求解还是备选方案切换，标签始终反映"当前网格实际使用的引擎"。
+  const solvedByLabel = useMemo(() => {
+    if (!result?.algorithm) return null;
+    const isJs =
+      result.algorithm.includes('preview') || result.algorithm.includes('超时降级');
+    return isJs ? 'JS 预览' : 'Rust ILP';
+  }, [result]);
+
   return (
     <main className="grid-canvas-wrap">
       <div className="canvas-header">
@@ -279,10 +287,8 @@ export default function GridCanvas() {
           <span>
             共 <strong>{total}</strong> 套
           </span>
-          {lastSolvedBy && (
-            <span className="muted">
-              {lastSolvedBy === 'rust' ? 'Rust ILP' : 'JS 预览'}
-            </span>
+          {solvedByLabel && (
+            <span className="muted">{solvedByLabel}</span>
           )}
         </div>
       </div>
@@ -309,7 +315,8 @@ export default function GridCanvas() {
 
       <div className="canvas-legend">
         {combinations.map((c, idx) => {
-          const assign = solveResult?.assignments.find((a) => a.combinationId === c.id);
+          // 图例与网格共用同一数据源 result：切换备选方案后数字与颜色保持一致
+          const assign = result?.assignments.find((a) => a.combinationId === c.id);
           const qty = assign?.quantity ?? 0;
           if (qty <= 0) return null;
           return (
@@ -319,10 +326,10 @@ export default function GridCanvas() {
             </span>
           );
         })}
-        {solveResult && solveResult.totalRemaining > 0 && (
+        {result && result.totalRemaining > 0 && (
           <span className="legend-item">
             <span className="legend-dot" style={{ background: UNUSED_COLOR }} />
-            剩余 {solveResult.totalRemaining}
+            剩余 {result.totalRemaining}
           </span>
         )}
       </div>

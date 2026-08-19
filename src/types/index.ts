@@ -16,6 +16,8 @@ export interface Combination {
   name: string;
   color?: string;
   items: CombinationItem[];
+  /** 组合权重偏好（1-10，默认 5）。越高越优先使用（不影响"用完房源"目标） */
+  weight?: number;
 }
 
 export interface ManualInput {

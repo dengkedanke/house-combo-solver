@@ -12,6 +12,7 @@ struct Prepared {
     remaining: Vec<u32>,    // 扣除手动后各户型剩余库存
     free_indices: Vec<usize>, // 参与自动求解的自由组合索引
     lower: Vec<u32>,        // 自由组合数量下界（"≥1"约束，与 free_indices 对齐）
+    weights: Vec<u8>,       // 自由组合权重偏好（1-10，与 free_indices 对齐）
 }
 
 /// 校验输入并构造求解所需数据结构
@@ -136,6 +137,12 @@ fn prepare(request: &SolveRequest) -> Result<Prepared, String> {
     // 自由组合下界（与 free_indices 对齐）
     let lower: Vec<u32> = free_indices.iter().map(|&k| lower_full[k]).collect();
 
+    // 自由组合权重偏好（与 free_indices 对齐），越界值收敛到 1-10
+    let weights: Vec<u8> = free_indices
+        .iter()
+        .map(|&k| request.combinations[k].weight.clamp(1, 10))
+        .collect();
+
     Ok(Prepared {
         usage,
         manual,
@@ -143,6 +150,7 @@ fn prepare(request: &SolveRequest) -> Result<Prepared, String> {
         remaining,
         free_indices,
         lower,
+        weights,
     })
 }
 
@@ -228,7 +236,13 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
             prep.free_indices.iter().map(|&k| prep.usage[k].clone()).collect();
         let free_remaining = prep.remaining.clone();
         let free_lower = prep.lower.clone();
-        match ilp::solve_ilp_with_cuts(&free_usage, &free_remaining, &free_lower, &[]) {
+        match ilp::solve_ilp_with_cuts_weighted(
+            &free_usage,
+            &free_remaining,
+            &free_lower,
+            &prep.weights,
+            &[],
+        ) {
             Some(v) => {
                 for (i, &k) in prep.free_indices.iter().enumerate() {
                     xs[k] = v[i];
@@ -257,12 +271,17 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
                 algorithm = "greedy";
             }
         }
-        // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界）
-        let free_totals: Vec<u32> = free_usage.iter().map(|u| u.iter().sum()).collect();
-        let mut free_xs: Vec<u32> = prep.free_indices.iter().map(|&k| xs[k]).collect();
-        balance_solution(&free_usage, &free_remaining, &free_totals, &free_lower, &mut free_xs);
-        for (i, &k) in prep.free_indices.iter().enumerate() {
-            xs[k] = free_xs[i];
+        // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界）。
+        // 注意：存在权重偏好（任一组合 weight ≠ 5）时跳过均衡化——
+        // 均衡转移会抵消"高权重组合优先"的意图（如 10/0 被均衡为 5/5）。
+        let has_preference = prep.weights.iter().any(|&w| w != 5);
+        if !has_preference {
+            let free_totals: Vec<u32> = free_usage.iter().map(|u| u.iter().sum()).collect();
+            let mut free_xs: Vec<u32> = prep.free_indices.iter().map(|&k| xs[k]).collect();
+            balance_solution(&free_usage, &free_remaining, &free_totals, &free_lower, &mut free_xs);
+            for (i, &k) in prep.free_indices.iter().enumerate() {
+                xs[k] = free_xs[i];
+            }
         }
     }
 
@@ -316,6 +335,7 @@ pub fn enumerate_solutions(
             &free_usage,
             &free_remaining,
             &prep.lower,
+            &prep.weights,
             &cuts,
             round_timeout,
         ) {
@@ -366,7 +386,15 @@ pub fn balance_solution(
     if n < 2 {
         return;
     }
+    // P1-5 修复：外层迭代硬上限，防止在组合数极多、解空间复杂时陷入超长迭代。
+    // 正常情况下均衡化会在少数几轮内收敛；达到上限即返回当前最佳结果（尽力均衡）。
+    const MAX_BALANCE_ITER: usize = 10_000;
+    let mut iter = 0;
     loop {
+        iter += 1;
+        if iter > MAX_BALANCE_ITER {
+            break;
+        }
         let mut improved = false;
         for a in 0..n {
             if xs[a] == 0 || totals[a] == 0 {
@@ -457,6 +485,7 @@ mod tests {
                     id: "c1".into(),
                     name: "组合A".into(),
                     color: None,
+                    weight: 5,
                     items: vec![
                         CombinationItem { type_id: "t1".into(), count: 1 },
                         CombinationItem { type_id: "t2".into(), count: 2 },
@@ -467,6 +496,7 @@ mod tests {
                     id: "c2".into(),
                     name: "组合B".into(),
                     color: None,
+                    weight: 5,
                     items: vec![
                         CombinationItem { type_id: "t2".into(), count: 1 },
                         CombinationItem { type_id: "t3".into(), count: 2 },
@@ -516,6 +546,7 @@ mod tests {
                 id: "c1".into(),
                 name: "组合A".into(),
                 color: None,
+                    weight: 5,
                 items: vec![
                     CombinationItem { type_id: "t1".into(), count: 1 },
                     CombinationItem { type_id: "t2".into(), count: 2 },
@@ -526,6 +557,7 @@ mod tests {
                 id: "c_empty".into(),
                 name: "空组合".into(),
                 color: None,
+                    weight: 5,
                 items: vec![],
             },
         ];
@@ -546,12 +578,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -578,12 +612,14 @@ mod tests {
                     id: "c1".into(),
                     name: "先定义".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "后定义".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
             ],
@@ -618,12 +654,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -645,6 +683,7 @@ mod tests {
                 id: "c1".into(),
                 name: "组合1".into(),
                 color: None,
+                    weight: 5,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
             }],
             manual_inputs: vec![],
@@ -663,12 +702,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
                 },
             ],
@@ -687,6 +728,7 @@ mod tests {
                 id: "c1".into(),
                 name: "组合1".into(),
                 color: None,
+                    weight: 5,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
             }],
             manual_inputs: vec![ManualInput { combination_id: "c1".into(), quantity: 5 }],
@@ -708,12 +750,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -740,12 +784,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -781,6 +827,7 @@ mod tests {
                 id: "c1".into(),
                 name: "组合1".into(),
                 color: None,
+                    weight: 5,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
             }],
             manual_inputs: vec![],
@@ -810,12 +857,14 @@ mod tests {
                     id: "c1".into(),
                     name: "组合1".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
                     id: "c2".into(),
                     name: "组合2".into(),
                     color: None,
+                    weight: 5,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -828,5 +877,155 @@ mod tests {
         let (sols, _truncated) = enumerate_solutions(&req, 10).unwrap();
         assert_eq!(sols.len(), 1);
         assert_eq!(sols[0].total_used, 2 + 6);
+    }
+
+    #[test]
+    fn weight_preference_prioritizes_high_weight() {
+        // 单户型 10 套；两个相同组合（各 1 套）。
+        // 权重偏好存在时跳过均衡化：高权重组合应优先占用（x1=10, x2=0）
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
+            combinations: vec![
+                Combination {
+                    id: "c1".into(),
+                    name: "高权重".into(),
+                    color: None,
+                    weight: 10,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+                Combination {
+                    id: "c2".into(),
+                    name: "低权重".into(),
+                    color: None,
+                    weight: 1,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+            ],
+            manual_inputs: vec![],
+            min_one_combination_ids: vec![],
+        };
+        let res = solve(&req).unwrap();
+        assert_eq!(res.total_used, 10, "利用率必须保持最优");
+        let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
+        let x2 = res.assignments.iter().find(|a| a.combination_id == "c2").map(|a| a.quantity).unwrap_or(0);
+        assert!(x1 > x2, "高权重组合应优先分配: x1={x1}, x2={x2}");
+    }
+
+    #[test]
+    fn default_weight_keeps_fairness() {
+        // 权重全默认(5) → 保持均衡化公平性（3/3 均分）
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 6 }],
+            combinations: vec![
+                Combination {
+                    id: "c1".into(),
+                    name: "组合1".into(),
+                    color: None,
+                    weight: 5,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+                Combination {
+                    id: "c2".into(),
+                    name: "组合2".into(),
+                    color: None,
+                    weight: 5,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+            ],
+            manual_inputs: vec![],
+            min_one_combination_ids: vec![],
+        };
+        let res = solve(&req).unwrap();
+        let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
+        let x2 = res.assignments.iter().find(|a| a.combination_id == "c2").map(|a| a.quantity).unwrap_or(0);
+        assert_eq!(x1, 3);
+        assert_eq!(x2, 3);
+    }
+
+    #[test]
+    fn weight_does_not_sacrifice_utilization() {
+        // 组合1=(1) 权重1、组合2=(2) 权重10，库存 10。
+        // 分层优化：阶段一利用最大化 10；阶段二在利用≥10 下加权 → x2=5,x1=0
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
+            combinations: vec![
+                Combination {
+                    id: "c1".into(),
+                    name: "小组合".into(),
+                    color: None,
+                    weight: 1,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+                Combination {
+                    id: "c2".into(),
+                    name: "大组合".into(),
+                    color: None,
+                    weight: 10,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
+                },
+            ],
+            manual_inputs: vec![],
+            min_one_combination_ids: vec![],
+        };
+        let res = solve(&req).unwrap();
+        assert_eq!(res.total_used, 10, "权重不得牺牲利用率");
+        let x2 = res.assignments.iter().find(|a| a.combination_id == "c2").map(|a| a.quantity).unwrap_or(0);
+        let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
+        assert!(x2 >= x1, "高权重大组合应更优先: x1={x1}, x2={x2}");
+    }
+
+    // ---- P1-3 回归：大组合数（n>60）应返回 TimedOut 而非 Infeasible ----
+    #[test]
+    fn ilp_large_n_returns_timed_out() {
+        // 61 个相同自由组合 + 单一户型库存 100：n=61>60 应直接返回 TimedOut
+        let usage: Vec<Vec<u32>> = (0..61).map(|_| vec![1u32]).collect();
+        let remaining = vec![100u32];
+        let lower = vec![0u32; 61];
+        let weights = vec![5u8; 61];
+        let cuts: Vec<ilp::Cut> = vec![];
+        let outcome = ilp::solve_ilp_detailed(&usage, &remaining, &lower, &weights, &cuts, 1000);
+        assert!(
+            matches!(outcome, ilp::IlpOutcome::TimedOut),
+            "n>60 应返回 TimedOut（可降级），而非 Infeasible（会被枚举误判为穷尽）"
+        );
+    }
+
+    // ---- P1-3 回归：大组合数枚举应标记 truncated，而非静默结束 ----
+    #[test]
+    fn enumerate_large_n_is_truncated() {
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 100 }],
+            combinations: (0..61)
+                .map(|i| Combination {
+                    id: format!("c{i}"),
+                    name: format!("组合{i}"),
+                    color: None,
+                    weight: 5,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                })
+                .collect(),
+            manual_inputs: vec![],
+            min_one_combination_ids: vec![],
+        };
+        let (sols, truncated) = enumerate_solutions(&req, 10).unwrap();
+        assert!(truncated, "n>60 枚举应置 truncated=true，避免漏解");
+        assert_eq!(sols.len(), 0, "n>60 首轮即超时，不应产出方案");
+    }
+
+    // ---- P1-5 回归：balance_solution 在大组合数下受迭代上限保护且不改变总套数 ----
+    #[test]
+    fn balance_solution_respects_iteration_cap() {
+        // 60 个组合，各消耗 t1 1 套；库存 600；初始各分配 10 → 共 600
+        let n = 60usize;
+        let usage: Vec<Vec<u32>> = (0..n).map(|_| vec![1u32]).collect();
+        let remaining = vec![600u32];
+        let totals: Vec<u32> = vec![1u32; n];
+        let lower: Vec<u32> = vec![0u32; n];
+        let mut xs: Vec<u32> = vec![10u32; n];
+        // 不应挂起：迭代上限保证终止；且总套数守恒、已均衡不被破坏
+        balance_solution(&usage, &remaining, &totals, &lower, &mut xs);
+        let sum: u32 = xs.iter().sum();
+        assert_eq!(sum, 600, "均衡化不得改变总套数");
+        assert!(xs.iter().all(|&x| x == xs[0]), "初始已均衡时不应被破坏");
     }
 }

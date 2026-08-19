@@ -141,6 +141,13 @@ export function jsSolve(req: SolveRequest): SolveResult {
   const lower = freeIdx.map((gi) =>
     req.minOneCombinationIds?.includes(req.combinations[gi].id) ? 1 : 0,
   );
+  // 自由组合权重偏好（1-10，默认 5）
+  const weights = freeIdx.map((gi) => {
+    const w = req.combinations[gi].weight ?? 5;
+    return Math.min(10, Math.max(1, Math.round(w)));
+  });
+  // 加权分数（分层优化阶段二的目标系数：1.0 + (w-1)*0.001）
+  const weightCoeff = weights.map((w) => 1.0 + (w - 1) * 0.001);
   // 预分配下界并扣减库存
   const lowerXs = new Array(freeIdx.length).fill(0);
   const remAfterLower = [...remaining];
@@ -153,7 +160,7 @@ export function jsSolve(req: SolveRequest): SolveResult {
     }
   });
 
-  let best = { xs: freeIdx.map(() => 0), used: 0, variance: Infinity };
+  let best = { xs: freeIdx.map(() => 0), used: 0, variance: Infinity, score: -Infinity };
   if (freeIdx.length > 0) {
     const orders: number[][] = [];
     const totals = freeUsage.map((u) => u.reduce((s, c) => s + c, 0));
@@ -175,22 +182,33 @@ export function jsSolve(req: SolveRequest): SolveResult {
         return avgA - avgB || a - b;
       }),
     );
+    // 策略5：权重降序（高权重组合优先，预览近似体现分层优化阶段二）
+    orders.push([...freeIdx].sort((a, b) => weights[pos.get(b)!] - weights[pos.get(a)!] || a - b));
     for (const order of orders) {
       const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!));
       // 叠加下界预分配
       const full = r.xs.map((x, i) => x + lowerXs[i]);
       const variance = xsVariance(full);
       const used = full.reduce((acc, x, i) => acc + x * totals[i], 0);
-      // 平局时优先方差小（组合数量更均衡），消除"先定义组合优先"偏见
-      if (used > best.used || (used === best.used && variance < best.variance)) {
-        best = { xs: full, used, variance };
+      // 加权分数：同利用下高权重组合优先（分层优化阶段二目标）
+      const score = full.reduce((acc, x, i) => acc + weightCoeff[i] * totals[i] * x, 0);
+      // 优先：利用率大 > 加权分数大 > 方差小
+      if (
+        used > best.used ||
+        (used === best.used && score > best.score) ||
+        (used === best.used && score === best.score && variance < best.variance)
+      ) {
+        best = { xs: full, used, variance, score };
       }
     }
     freeIdx.forEach((k, i) => {
       xs[k] = best.xs[i];
     });
-    // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界）
-    balanceSolution(freeUsage, remAfterLower, totals, lower, best.xs);
+    // 公平性：仅当无权重偏好时均衡化（否则均衡转移会抵消高权重优先意图）
+    const hasPreference = weights.some((w) => w !== 5);
+    if (!hasPreference) {
+      balanceSolution(freeUsage, remAfterLower, totals, lower, best.xs);
+    }
     freeIdx.forEach((k, i) => {
       xs[k] = best.xs[i];
     });
@@ -332,7 +350,9 @@ export function jsEnumerate(req: SolveRequest, max = 50): EnumerateResponse {
         usage,
         full,
         manual,
-        'greedy (预览枚举)',
+        // 与 jsSolve 的 'greedy (preview)' 保持同一 'preview' 标记，
+        // 供 P0-2/P1-4 的引擎判定（includes('preview')）正确识别 JS 产物
+        'greedy (preview 枚举)',
         Math.round(performance.now() - start),
       ),
     );
