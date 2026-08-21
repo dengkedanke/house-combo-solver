@@ -1,6 +1,6 @@
 import { useAppStore } from '../store/useAppStore';
-import { getCombinationColor } from '../utils/colors';
-import { UNUSED_COLOR } from '../utils/colors';
+// #16：合并同一模块的重复 import
+import { getCombinationColor, UNUSED_COLOR } from '../utils/colors';
 
 export default function ResultPanel() {
   const solveResult = useAppStore((s) => s.solveResult);

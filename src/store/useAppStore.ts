@@ -29,6 +29,12 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   });
 }
 
+// #4 修复：请求序列号。自动计算模式下防抖只能减少触发频率、不能保证串行
+//（前一个 Rust 求解最长 5s 未返回时用户继续改输入会并发多个 solve），
+// 序列号确保只接受"最新一次"请求的结果，过期结果直接丢弃，避免展示过期数据。
+let solveSeq = 0;
+let enumerateSeq = 0;
+
 async function safeSolve(req: SolveRequest): Promise<SolveResult> {
   try {
     const result = await withTimeout(
@@ -55,8 +61,9 @@ async function safeSolve(req: SolveRequest): Promise<SolveResult> {
 async function safeEnumerate(req: SolveRequest): Promise<EnumerateResponse> {
   try {
     // 枚举可能多轮求解，给更宽松的超时（30s）
+    // #10：透传 maxSolutions（Rust 端上限保护 clamp 1..200，默认 50）
     const result = await withTimeout(
-      invoke<EnumerateResponse>('enumerate_solutions', { request: req }),
+      invoke<EnumerateResponse>('enumerate_solutions', { request: req, maxSolutions: 50 }),
       30000,
     );
     return result;
@@ -249,6 +256,8 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ solveResult: null, calculating: false });
         return;
       }
+      // #4：登记本次请求序列号，仅最新请求的结果可写入状态
+      const seq = ++solveSeq;
       // 输入变化后旧的备选方案已失效，清空（避免展示过期数据）
       set({
         calculating: true,
@@ -259,6 +268,7 @@ export const useAppStore = create<AppState>((set, get) => {
       });
       try {
         const result = await safeSolve(req);
+        if (seq !== solveSeq) return; // 过期结果：丢弃（更新的请求在途/已完成）
         // 判定求解引擎：JS 预览（algorithm 含 'preview'）或 JS 超时降级（含 '超时降级'，
         // 仅 JS 路径会追加该标记）均归为 'js'；Rust ILP / Rust 贪心兜底归为 'rust'。
         // 注意：不能仅凭 'greedy' 判定，否则会把 Rust 原生贪心兜底误判为 JS。
@@ -270,7 +280,10 @@ export const useAppStore = create<AppState>((set, get) => {
           lastSolvedBy: isJs ? 'js' : 'rust',
         });
       } catch (e) {
-        set({ calculating: false, error: String(e) });
+        if (seq !== solveSeq) return;
+        // #6：保留可读错误消息（Error 取 message，其余兜底 String）
+        const msg = e instanceof Error ? e.message : String(e);
+        set({ calculating: false, error: msg });
       }
     },
 
@@ -280,9 +293,12 @@ export const useAppStore = create<AppState>((set, get) => {
         set({ error: '请先添加房源类型和组合', enumerating: false });
         return;
       }
+      // #4：枚举同样只接受最新一次请求的结果
+      const seq = ++enumerateSeq;
       set({ enumerating: true, error: null });
       try {
         const resp = await safeEnumerate(req);
+        if (seq !== enumerateSeq) return;
         set({
           solutions: resp.solutions,
           activeSolutionIndex: resp.solutions.length > 0 ? 0 : null,
@@ -294,8 +310,10 @@ export const useAppStore = create<AppState>((set, get) => {
           set({ error: '未找到可行方案' });
         }
       } catch (e) {
-        // 异常时保留已保存的方案，仅提示错误
-        set({ enumerating: false, error: String(e) });
+        if (seq !== enumerateSeq) return;
+        // 异常时保留已保存的方案，仅提示错误（#6 可读消息）
+        const msg = e instanceof Error ? e.message : String(e);
+        set({ enumerating: false, error: msg });
       }
     },
 

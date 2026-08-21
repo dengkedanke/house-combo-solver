@@ -92,6 +92,8 @@ function CombinationEditor() {
   const addCombination = useAppStore((s) => s.addCombination);
   const removeCombination = useAppStore((s) => s.removeCombination);
   const setCombinationItem = useAppStore((s) => s.setCombinationItem);
+  // #11：从 hook 解构，避免在 JSX 中直接 getState()（保持响应式绑定）
+  const updateCombination = useAppStore((s) => s.updateCombination);
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState('');
   // 待删除的组合（非 null 时弹确认框）
@@ -137,7 +139,7 @@ function CombinationEditor() {
               <input
                 className="combo-name-input"
                 value={c.name}
-                onChange={(e) => useAppStore.getState().updateCombination(c.id, { name: e.target.value })}
+                onChange={(e) => updateCombination(c.id, { name: e.target.value })}
               />
               <span className="muted combo-total">{comboTotal(c.id)} 套</span>
               <button

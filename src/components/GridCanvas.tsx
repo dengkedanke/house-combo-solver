@@ -124,14 +124,15 @@ export default function GridCanvas() {
 
   const layout = computeGridLayout(total);
 
-  const drawFrame = (progress: number) => {
-    const canvas = canvasRef.current;
-    if (!canvas || layout.rows === 0 || layout.cols === 0) return;
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-
+  // #8：布局参数只算一次（drawFrame 与 handleMove 共用），
+  // 避免两处手算漂移导致 hover 命中偏移
+  const layoutParams = useMemo(() => {
+    if (layout.rows === 0 || layout.cols === 0) return null;
     const pad = 8;
-    const gap = Math.min(2, (Math.min(size.w, size.h) - pad * 2) / (Math.max(layout.rows, layout.cols) * 8));
+    const gap = Math.min(
+      2,
+      (Math.min(size.w, size.h) - pad * 2) / (Math.max(layout.rows, layout.cols) * 8),
+    );
     const cell = Math.min(
       (size.w - pad * 2) / layout.cols - gap,
       (size.h - pad * 2) / layout.rows - gap,
@@ -140,6 +141,16 @@ export default function GridCanvas() {
     const gridH = layout.rows * (cell + gap) - gap;
     const offsetX = (size.w - gridW) / 2;
     const offsetY = (size.h - gridH) / 2;
+    return { pad, gap, cell, offsetX, offsetY };
+  }, [size, layout]);
+
+  const drawFrame = (progress: number) => {
+    const canvas = canvasRef.current;
+    if (!canvas || layout.rows === 0 || layout.cols === 0) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+    if (!layoutParams) return;
+    const { gap, cell, offsetX, offsetY } = layoutParams;
 
     // 高 DPI 适配
     const dpr = window.devicePixelRatio || 1;
@@ -170,7 +181,12 @@ export default function GridCanvas() {
       ctx.fillStyle = fill;
       const r = Math.max(1.5, cell * 0.18);
       ctx.beginPath();
-      ctx.roundRect(x, y, cell, cell, r);
+      // #13：roundRect（Chrome 99+/Safari 16+）在旧 WebView 不可用时回退普通矩形
+      if (typeof ctx.roundRect === 'function') {
+        ctx.roundRect(x, y, cell, cell, r);
+      } else {
+        ctx.rect(x, y, cell, cell);
+      }
       ctx.fill();
 
       if (isHover) {
@@ -227,18 +243,9 @@ export default function GridCanvas() {
     const rect = canvas.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-
-    // 重新计算布局参数（与 drawFrame 一致）
-    const pad = 8;
-    const gap = Math.min(2, (Math.min(size.w, size.h) - pad * 2) / (Math.max(layout.rows, layout.cols) * 8));
-    const cell = Math.min(
-      (size.w - pad * 2) / layout.cols - gap,
-      (size.h - pad * 2) / layout.rows - gap,
-    );
-    const gridW = layout.cols * (cell + gap) - gap;
-    const gridH = layout.rows * (cell + gap) - gap;
-    const offsetX = (size.w - gridW) / 2;
-    const offsetY = (size.h - gridH) / 2;
+    // #8：复用统一的布局参数（与 drawFrame 同源），避免 hover 偏移
+    if (!layoutParams) return;
+    const { gap, cell, offsetX, offsetY } = layoutParams;
 
     const col = Math.floor((x - offsetX) / (cell + gap));
     const row = Math.floor((y - offsetY) / (cell + gap));

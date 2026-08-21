@@ -902,3 +902,23 @@ body {
   line-height: 1.6;
   color: var(--text-muted);
 }
+
+/* #12：顶层错误边界 */
+.error-boundary {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  min-height: 100vh;
+  padding: 32px;
+  text-align: center;
+}
+.error-boundary h2 {
+  margin: 0;
+  font-size: 20px;
+}
+.error-boundary .muted {
+  max-width: 480px;
+  overflow-wrap: break-word;
+}

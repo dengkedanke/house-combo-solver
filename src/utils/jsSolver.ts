@@ -15,11 +15,12 @@ function solveGreedyOneOrder(
     // 跳过未完整定义的组合（全 0），否则 while 条件恒真导致死循环
     if (u.every((c) => c === 0)) continue;
     // 批量分配：一步算出该组合可分配的最大数量（最小需求比率）
-    let maxK = Number.MAX_SAFE_INTEGER;
+    // #15：用 Infinity 作"未受限"哨兵，语义更清晰（Math.min 处理一致）
+    let maxK = Infinity;
     for (let j = 0; j < rem.length; j++) {
       if (u[j] > 0) maxK = Math.min(maxK, Math.floor(rem[j] / u[j]));
     }
-    if (maxK === Number.MAX_SAFE_INTEGER) maxK = 0;
+    if (maxK === Infinity) maxK = 0;
     if (maxK > 0) {
       for (let j = 0; j < rem.length; j++) rem[j] -= u[j] * maxK;
       xs[k] = maxK;

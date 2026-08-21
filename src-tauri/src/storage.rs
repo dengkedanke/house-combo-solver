@@ -19,7 +19,15 @@ pub fn save_config(app: AppHandle, config: Value) -> Result<(), String> {
     let path = dir.join("config.json");
     let envelope = serde_json::json!({ "version": CONFIG_VERSION, "config": config });
     let json = serde_json::to_string_pretty(&envelope).map_err(|e| e.to_string())?;
-    std::fs::write(path, json).map_err(|e| format!("保存配置失败: {e}"))
+    // #5 修复：先写同目录临时文件再 rename 覆盖（同目录 rename 为原子操作），
+    // 避免写入中途崩溃/断电导致 config.json 损坏
+    let tmp = dir.join("config.json.tmp");
+    std::fs::write(&tmp, &json).map_err(|e| format!("写入配置失败: {e}"))?;
+    std::fs::rename(&tmp, &path).map_err(|e| {
+        // rename 失败时清理临时文件，避免残留
+        let _ = std::fs::remove_file(&tmp);
+        format!("保存配置失败: {e}")
+    })
 }
 
 /// 从应用数据目录加载配置，无配置时返回 None。

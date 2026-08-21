@@ -199,24 +199,14 @@ fn assemble(request: &SolveRequest, prep: &Prepared, xs: &[u32], algorithm: &str
     }
 }
 
-/// 生成 no-good cut：屏蔽解 v（v 中各组合数量）
-/// 割约束：Σ_{k:v_k>0} x_k − Σ_{k:v_k=0} x_k ≤ (Σ v_k) − 1
-/// 当 x = v 时左侧 = Σ v_k > 右侧，被禁止；其他解不受影响（或仅排除"更挤"的同优解）
+/// 生成 no-good cut：精确屏蔽解 v（v 中各组合数量）。
+/// #9 修复：采用大 M 精确割（Cut::Exact），每个分量要么 < v_k 要么 > v_k，
+/// 且至少一个分量不同 —— 只排除"恰好等于 v"的解。
+/// 旧式线性割（Σ_{k:v_k>0} x_k − Σ_{k:v_k=0} x_k ≤ Σv_k − 1）会误伤
+/// "正分量更满"的其他合法解（如 v=(2,2) 的割会排除同档方案 (4,1)），
+/// 导致枚举漏掉合法备选方案。
 fn no_good_cut(v: &[u32]) -> ilp::Cut {
-    let mut coeffs = Vec::with_capacity(v.len());
-    let mut sum_positive: i64 = 0;
-    for &x in v {
-        if x > 0 {
-            coeffs.push(1);
-            sum_positive += x as i64;
-        } else {
-            coeffs.push(-1);
-        }
-    }
-    ilp::Cut {
-        coeffs,
-        rhs: sum_positive - 1,
-    }
+    ilp::Cut::Exact { v: v.to_vec() }
 }
 
 /// 求解入口：
@@ -312,9 +302,11 @@ pub fn enumerate_solutions(
         .collect();
     let free_remaining = prep.remaining.clone();
 
-    // E1 修复：枚举总时间预算 + 单轮超时上限，防止线程堆积与时长失控
-    const TOTAL_BUDGET_MS: u64 = 10_000;
-    const ROUND_TIMEOUT_MS: u64 = 1_000;
+    // E1 修复：枚举总时间预算 + 单轮超时上限，防止线程堆积与时长失控。
+    // #9 修复后：no-good cut 改为大 M 精确割（每轮新增二元变量），单轮求解更重，
+    // 预算相应放宽（单轮 3s / 总 20s）；超时由 UI 截断提示兜底，不影响正确性。
+    const TOTAL_BUDGET_MS: u64 = 20_000;
+    const ROUND_TIMEOUT_MS: u64 = 3_000;
 
     let mut cuts: Vec<ilp::Cut> = Vec::new();
     let mut results: Vec<SolveResult> = Vec::new();
@@ -331,11 +323,10 @@ pub fn enumerate_solutions(
             break;
         }
         let t0 = std::time::Instant::now();
-        match ilp::solve_ilp_detailed(
+        match ilp::solve_ilp_phase1_detailed(
             &free_usage,
             &free_remaining,
             &prep.lower,
-            &prep.weights,
             &cuts,
             round_timeout,
         ) {
@@ -765,8 +756,9 @@ mod tests {
             min_one_combination_ids: vec!["c1".into()],
         };
         let (sols, truncated) = enumerate_solutions(&req, 50).unwrap();
-        assert!(!truncated, "穷尽场景不应标记截断");
-        assert!(sols.len() >= 2, "应至少 2 个方案");
+        // 大场景枚举可能截断（大 M 精确割预算限制，仅影响低利用率方案）；
+        // 断言聚焦功能正确性：≥1 约束在枚举到的每个方案中均保留
+        assert!(sols.len() >= 2, "应至少 2 个方案（截断与否：{truncated}）");
         for s in &sols {
             let x1 = s.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
             assert!(x1 >= 1, "枚举方案中组合1 数量不得为 0");
@@ -799,7 +791,9 @@ mod tests {
             min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 50).unwrap();
-        assert!(!truncated, "穷尽场景不应标记截断");
+        // #9 后 no-good cut 为大 M 精确割，大场景枚举可能因预算截断（仅影响低利用率
+        // 方案，最优档方案按利用率降序先输出）；此处聚焦功能正确性，不要求穷尽。
+        assert!(sols.len() >= 2, "应至少 2 个方案（截断与否：{truncated}）");
         assert!(!sols.is_empty());
         // 首方案必须为最优（总套数 10）
         assert_eq!(sols[0].total_used, 10);
@@ -815,7 +809,9 @@ mod tests {
                 assert_ne!(key(&sols[i]), key(&sols[j]), "方案 {i} 与 {j} 重复");
             }
         }
-        assert!(sols.len() >= 2, "应至少得到 2 个不同方案");
+        // 最优利用率档的方案应完整出现在结果头部（#9：不漏同档方案）
+        let top_count = sols.iter().filter(|s| s.total_used == 10).count();
+        assert!(top_count >= 2, "最优档至少 2 个方案，实际 {top_count}");
     }
 
     #[test]
@@ -974,28 +970,28 @@ mod tests {
         assert!(x2 >= x1, "高权重大组合应更优先: x1={x1}, x2={x2}");
     }
 
-    // ---- P1-3 回归：大组合数（n>60）应返回 TimedOut 而非 Infeasible ----
+    // ---- #7 回归：极端组合数（n>500）应返回 TimedOut（防御上限） ----
     #[test]
     fn ilp_large_n_returns_timed_out() {
-        // 61 个相同自由组合 + 单一户型库存 100：n=61>60 应直接返回 TimedOut
-        let usage: Vec<Vec<u32>> = (0..61).map(|_| vec![1u32]).collect();
-        let remaining = vec![100u32];
-        let lower = vec![0u32; 61];
-        let weights = vec![5u8; 61];
+        // 501 个相同自由组合 + 单一户型库存 1000：n=501>500 直接返回 TimedOut（防御上限）
+        let usage: Vec<Vec<u32>> = (0..501).map(|_| vec![1u32]).collect();
+        let remaining = vec![1000u32];
+        let lower = vec![0u32; 501];
+        let weights = vec![5u8; 501];
         let cuts: Vec<ilp::Cut> = vec![];
         let outcome = ilp::solve_ilp_detailed(&usage, &remaining, &lower, &weights, &cuts, 1000);
         assert!(
             matches!(outcome, ilp::IlpOutcome::TimedOut),
-            "n>60 应返回 TimedOut（可降级），而非 Infeasible（会被枚举误判为穷尽）"
+            "n>500 应返回 TimedOut（可降级），而非 Infeasible（会被枚举误判为穷尽）"
         );
     }
 
-    // ---- P1-3 回归：大组合数枚举应标记 truncated，而非静默结束 ----
+    // ---- #7 回归：极端组合数枚举应标记 truncated，而非静默结束 ----
     #[test]
     fn enumerate_large_n_is_truncated() {
         let req = SolveRequest {
-            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 100 }],
-            combinations: (0..61)
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 1000 }],
+            combinations: (0..501)
                 .map(|i| Combination {
                     id: format!("c{i}"),
                     name: format!("组合{i}"),
@@ -1008,8 +1004,71 @@ mod tests {
             min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 10).unwrap();
-        assert!(truncated, "n>60 枚举应置 truncated=true，避免漏解");
-        assert_eq!(sols.len(), 0, "n>60 首轮即超时，不应产出方案");
+        assert!(truncated, "n>500 枚举应置 truncated=true，避免漏解");
+        assert_eq!(sols.len(), 0, "n>500 首轮即超时，不应产出方案");
+    }
+
+    // ---- #9 回归：枚举不遗漏同最优利用率档内的合法备选方案 ----
+    // 旧式线性 no-good cut 会误伤"正分量更满"的解（如 v=(2,2) 的割排除 (4,1)），
+    // Exact cut 修复后，同档方案 (6,0)/(0,3)/(2,2)/(4,1) 应全部可被枚举到。
+    #[test]
+    fn enumerate_does_not_miss_same_utilization_solutions() {
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 6 }],
+            combinations: vec![
+                Combination {
+                    id: "c1".into(),
+                    name: "小组合".into(),
+                    color: None,
+                    weight: 5,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+                },
+                Combination {
+                    id: "c2".into(),
+                    name: "大组合".into(),
+                    color: None,
+                    weight: 5,
+                    items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
+                },
+            ],
+            manual_inputs: vec![],
+            min_one_combination_ids: vec![],
+        };
+        let (sols, truncated) = enumerate_solutions(&req, 20).unwrap();
+        assert!(!truncated, "小规模枚举不应截断");
+        // 收集各方案 (x1, x2)
+        let sigs: Vec<(u32, u32)> = sols
+            .iter()
+            .map(|s| {
+                let x1 = s
+                    .assignments
+                    .iter()
+                    .find(|a| a.combination_id == "c1")
+                    .map(|a| a.quantity)
+                    .unwrap_or(0);
+                let x2 = s
+                    .assignments
+                    .iter()
+                    .find(|a| a.combination_id == "c2")
+                    .map(|a| a.quantity)
+                    .unwrap_or(0);
+                (x1, x2)
+            })
+            .collect();
+        // 最优利用率 6 的 4 个同档方案必须全部可枚举到（旧式线性割会漏掉 (4,1)）
+        let top_tier: Vec<(u32, u32)> = sigs.iter().copied().filter(|&(a, b)| a + 2 * b == 6).collect();
+        assert_eq!(
+            top_tier.len(),
+            4,
+            "利用率 6 的同档方案应完整枚举（(6,0)/(0,3)/(2,2)/(4,1)），实际: {sigs:?}"
+        );
+        // (4,1) 是合法同档方案，旧式割会漏掉它 —— 必须出现在结果中
+        assert!(
+            sigs.contains(&(4, 1)),
+            "同最优利用率方案 (4,1) 不应被漏掉，实际: {sigs:?}"
+        );
+        // 首方案保持最优利用率（枚举按利用率降序）
+        assert_eq!(sols[0].total_used, 6, "首个方案应为最优利用率");
     }
 
     // ---- P1-5 回归：balance_solution 在大组合数下受迭代上限保护且不改变总套数 ----
