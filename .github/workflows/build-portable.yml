@@ -39,9 +39,10 @@ jobs:
     steps:
       # ---------------------------------------------------------------------
       # 1. 检出代码
+      #    v5：运行时 Node 24（消除 Node 20 弃用告警）
       # ---------------------------------------------------------------------
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       # ---------------------------------------------------------------------
       # 2. 安装 Rust 工具链（MSVC）
@@ -52,10 +53,11 @@ jobs:
 
       # ---------------------------------------------------------------------
       # 3. 安装 Node.js（前端构建）+ npm 依赖缓存
-      #    actions/setup-node 的 cache: npm 按 package-lock.json 缓存 node_modules
+      #    actions/setup-node@v5 的 cache: npm 按 package-lock.json 缓存 node_modules
+      #    （v5：运行时 Node 24，消除 Node 20 弃用告警）
       # ---------------------------------------------------------------------
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -117,9 +119,10 @@ jobs:
       #    - 版本标签触发 → 上传到该标签的正式 Release（draft: false）
       #    - main 分支触发 → 上传到 "continuous" 标签的预发布（draft: true，防误发）
       #    - 手动触发（非标签）→ 同 main 分支行为
+      #    v3：运行时 Node 24（消除 Node 20 弃用告警）
       # ---------------------------------------------------------------------
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'continuous' }}
           name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'Continuous Build (main)' }}
