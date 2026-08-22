@@ -922,3 +922,19 @@ body {
   max-width: 480px;
   overflow-wrap: break-word;
 }
+
+/* 数量区间（下限/上限）输入 */
+.combo-range {
+  display: flex;
+  gap: 10px;
+  margin: 4px 0 6px 18px;
+}
+.range-field {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+}
+.range-field .qty-input {
+  width: 58px;
+}

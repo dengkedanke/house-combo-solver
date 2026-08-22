@@ -21,12 +21,14 @@ const MAX_ACTIVE_ILP_THREADS: usize = 64;
 static ACTIVE_ILP_THREADS: AtomicUsize = AtomicUsize::new(0);
 
 /// 当前活跃的 ILP 后台线程数（诊断/测试用）
+#[cfg_attr(not(test), allow(dead_code))]
 pub fn active_ilp_threads() -> usize {
     ACTIVE_ILP_THREADS.load(Ordering::Relaxed)
 }
 
 /// 增量约束（no-good cut），用于"遍历备选方案"——屏蔽已求得的解，迫使求解器寻找下一个不同方案。
 #[derive(Debug, Clone)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub enum Cut {
     /// 线性不等式：Σ(coeffs[k] × x_k) ≤ rhs。
     /// 仅用于单分量场景/测试；对一般整数向量会过度排除"正分量更满"的解。
@@ -42,10 +44,11 @@ pub enum Cut {
 /// usage[k][j] = 组合 k 需要户型 j 的套数
 /// remaining[j] = 户型 j 的剩余可用库存
 /// 返回各组合的最优数量（与 usage 行序对应）
-/// 注：主流程使用 solve_ilp_with_cuts（支持下界），本函数保留为便捷 API（测试使用）
+/// 注：主流程使用 solve_ilp_with_cuts（支持下界/上界），本函数保留为便捷 API（测试使用）
 #[allow(dead_code)]
 pub fn solve_ilp(usage: &[Vec<u32>], remaining: &[u32]) -> Option<Vec<u32>> {
-    solve_ilp_with_cuts(usage, remaining, &[], &[])
+    let upper = vec![999u32; usage.len()];
+    solve_ilp_with_cuts(usage, remaining, &[], &upper, &[])
 }
 
 /// ILP 求解三态结果（用于区分"无解"与"超时"）
@@ -56,17 +59,18 @@ pub enum IlpOutcome {
     TimedOut,
 }
 
-/// 带下界与增量约束（cuts）的 ILP 求解：
-/// - lower[k]：组合 k 的数量下界（如"≥1"约束，默认 0）
+/// 带下界/上界与增量约束（cuts）的 ILP 求解：
+/// - lower[k]：组合 k 的数量下界（组合 min，默认 0）
+/// - upper[k]：组合 k 的数量上界（组合 max，默认 999）
 /// - cuts：增量约束（no-good cut，用于枚举备选方案）
-/// lower/cuts 为空时等价于 solve_ilp。
 pub fn solve_ilp_with_cuts(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     cuts: &[Cut],
 ) -> Option<Vec<u32>> {
-    solve_ilp_with_cuts_weighted(usage, remaining, lower, &[], cuts)
+    solve_ilp_with_cuts_weighted(usage, remaining, lower, upper, &[], cuts)
 }
 
 /// 带权重偏好的两阶段求解（solve_ilp_with_cuts + weights）。
@@ -75,10 +79,11 @@ pub fn solve_ilp_with_cuts_weighted(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     weights: &[u8],
     cuts: &[Cut],
 ) -> Option<Vec<u32>> {
-    match solve_ilp_detailed(usage, remaining, lower, weights, cuts, ILP_TIMEOUT_MS) {
+    match solve_ilp_detailed(usage, remaining, lower, upper, weights, cuts, ILP_TIMEOUT_MS) {
         IlpOutcome::Solved(v) => Some(v),
         _ => None,
     }
@@ -90,11 +95,12 @@ pub fn solve_ilp_detailed(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     weights: &[u8],
     cuts: &[Cut],
     timeout_ms: u64,
 ) -> IlpOutcome {
-    solve_ilp_detailed_impl(usage, remaining, lower, weights, cuts, timeout_ms, true)
+    solve_ilp_detailed_impl(usage, remaining, lower, upper, weights, cuts, timeout_ms, true)
 }
 
 /// 枚举专用：仅阶段一（最大化利用率 + cuts）的 ILP 求解。
@@ -104,16 +110,18 @@ pub fn solve_ilp_phase1_detailed(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     cuts: &[Cut],
     timeout_ms: u64,
 ) -> IlpOutcome {
-    solve_ilp_detailed_impl(usage, remaining, lower, &[], cuts, timeout_ms, false)
+    solve_ilp_detailed_impl(usage, remaining, lower, upper, &[], cuts, timeout_ms, false)
 }
 
 fn solve_ilp_detailed_impl(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     weights: &[u8],
     cuts: &[Cut],
     timeout_ms: u64,
@@ -138,6 +146,7 @@ fn solve_ilp_detailed_impl(
     let usage_owned = usage.to_vec();
     let remaining_owned = remaining.to_vec();
     let lower_owned = lower.to_vec();
+    let upper_owned = upper.to_vec();
     let weights_owned = weights.to_vec();
     let cuts_owned = cuts.to_vec();
     ACTIVE_ILP_THREADS.fetch_add(1, Ordering::Relaxed);
@@ -146,6 +155,7 @@ fn solve_ilp_detailed_impl(
             &usage_owned,
             &remaining_owned,
             &lower_owned,
+            &upper_owned,
             &cuts_owned,
             &weights_owned,
             weighted,
@@ -165,6 +175,7 @@ fn solve_ilp_inner(
     usage: &[Vec<u32>],
     remaining: &[u32],
     lower: &[u32],
+    upper: &[u32],
     cuts: &[Cut],
     weights: &[u8],
     weighted: bool,
@@ -176,10 +187,17 @@ fn solve_ilp_inner(
     let big_m: f64 = (total_houses + 1) as f64;
 
     // ---------- 阶段一：最大化利用率 ----------
-    // 在库存 + 下界 + no-good cut 约束下，最大化已分配总套数 maxUtil
+    // 在库存 + 下界/上界 + no-good cut 约束下，最大化已分配总套数 maxUtil
     let mut vars1 = variables!();
     let xs1: Vec<Variable> = (0..n)
-        .map(|k| vars1.add(variable().min(lower.get(k).copied().unwrap_or(0) as f64).integer()))
+        .map(|k| {
+            vars1.add(
+                variable()
+                    .min(lower.get(k).copied().unwrap_or(0) as f64)
+                    .max(upper.get(k).copied().unwrap_or(999) as f64)
+                    .integer(),
+            )
+        })
         .collect();
     // #9：为每个 Exact cut 预分配二元变量（必须在 maximise 之前添加到模型）。
     // 每分量：v_k>0 需要 a（上翻 x≥v+1）与 b（下翻 x≤v−1）两个；
@@ -292,7 +310,14 @@ fn solve_ilp_inner(
     // weightCoeff = 1.0 + (weight - 1) * 0.001 —— 1~10 只带来 0~0.9% 微小差异
     let mut vars2 = variables!();
     let xs2: Vec<Variable> = (0..n)
-        .map(|k| vars2.add(variable().min(lower.get(k).copied().unwrap_or(0) as f64).integer()))
+        .map(|k| {
+            vars2.add(
+                variable()
+                    .min(lower.get(k).copied().unwrap_or(0) as f64)
+                    .max(upper.get(k).copied().unwrap_or(999) as f64)
+                    .integer(),
+            )
+        })
         .collect();
     let utilized = vars2.add(variable().min(0.0));
     // #9：阶段二同样为 Exact cut 预分配二元变量（v_k=0 分量仅上翻变量）
@@ -436,6 +461,7 @@ mod tests {
         // 单户型 6 套；两个相同组合（各 1 套）→ 任意最优解满足 x0+x1=6
         let usage = vec![vec![1], vec![1]];
         let remaining = vec![6];
+        let upper = vec![999, 999];
         let first = solve_ilp(&usage, &remaining).unwrap();
         assert_eq!(first[0] + first[1], 6, "首次求解必须为最优");
         // 屏蔽 first 后，应得到不同的（仍最优的）解
@@ -443,7 +469,7 @@ mod tests {
             coeffs: first.iter().map(|&x| if x > 0 { 1 } else { -1 }).collect(),
             rhs: first.iter().map(|&x| x as i64).sum::<i64>() - 1,
         };
-        let second = solve_ilp_with_cuts(&usage, &remaining, &[], &[cut]).unwrap();
+        let second = solve_ilp_with_cuts(&usage, &remaining, &[], &upper, &[cut]).unwrap();
         assert_ne!(second, first);
         assert_eq!(second[0] + second[1], 6, "第二个方案仍应最大化总套数");
     }
@@ -453,19 +479,20 @@ mod tests {
         // 单户型 3 套；组合1=(1)。目标最大化 → x1=3；逐级加割递减直至无解
         let usage = vec![vec![1]];
         let remaining = vec![3];
+        let upper = vec![999];
         let first = solve_ilp(&usage, &remaining).unwrap();
         assert_eq!(first, vec![3]);
         let cut = Cut::Linear { coeffs: vec![1], rhs: 2 };
-        let second = solve_ilp_with_cuts(&usage, &remaining, &[], &[cut.clone()]).unwrap();
+        let second = solve_ilp_with_cuts(&usage, &remaining, &[], &upper, &[cut.clone()]).unwrap();
         assert_eq!(second, vec![2]);
         let cut2 = Cut::Linear { coeffs: vec![1], rhs: 1 };
-        let third = solve_ilp_with_cuts(&usage, &remaining, &[], &[cut.clone(), cut2.clone()]).unwrap();
+        let third = solve_ilp_with_cuts(&usage, &remaining, &[], &upper, &[cut.clone(), cut2.clone()]).unwrap();
         assert_eq!(third, vec![1]);
         let cut3 = Cut::Linear { coeffs: vec![1], rhs: 0 };
-        let fourth = solve_ilp_with_cuts(&usage, &remaining, &[], &[cut.clone(), cut2.clone(), cut3]).unwrap();
+        let fourth = solve_ilp_with_cuts(&usage, &remaining, &[], &upper, &[cut.clone(), cut2.clone(), cut3]).unwrap();
         assert_eq!(fourth, vec![0]);
         let cut4 = Cut::Linear { coeffs: vec![1], rhs: -1 };
-        assert!(solve_ilp_with_cuts(&usage, &remaining, &[], &[cut, cut2, cut4]).is_none());
+        assert!(solve_ilp_with_cuts(&usage, &remaining, &[], &upper, &[cut, cut2, cut4]).is_none());
     }
 
     // ---- #9 回归：Exact cut 只排除目标解，不误伤"正分量更满"的合法解 ----
@@ -476,8 +503,9 @@ mod tests {
         // Exact cut 只排除 (2,2)，(4,1)（利用率 6）必须仍可达。
         let usage = vec![vec![1], vec![2]];
         let remaining = vec![6];
+        let upper = vec![999, 999];
         let cut = Cut::Exact { v: vec![2, 2] };
-        let xs = solve_ilp_with_cuts(&usage, &remaining, &[0, 0], &[cut]).unwrap();
+        let xs = solve_ilp_with_cuts(&usage, &remaining, &[0, 0], &upper, &[cut]).unwrap();
         let used = xs[0] + xs[1] * 2;
         assert_eq!(used, 6, "Exact cut 不得牺牲利用率: xs={xs:?}");
         assert_ne!(xs.as_slice(), &[2, 2], "Exact cut 必须排除目标解本身");
@@ -489,13 +517,15 @@ mod tests {
     fn concurrent_solves_respect_limit_and_release() {
         let usage = vec![vec![1, 1], vec![2, 1]];
         let remaining = vec![10, 10];
+        let upper = vec![999, 999];
         let handles: Vec<_> = (0..4)
             .map(|_| {
                 let u = usage.clone();
                 let r = remaining.clone();
+                let up = upper.clone();
                 std::thread::spawn(move || {
                     matches!(
-                        solve_ilp_detailed(&u, &r, &[0, 0], &[5, 5], &[], 3000),
+                        solve_ilp_detailed(&u, &r, &[0, 0], &up, &[5, 5], &[], 3000),
                         IlpOutcome::Solved(_)
                     )
                 })

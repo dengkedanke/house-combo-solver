@@ -11,7 +11,8 @@ struct Prepared {
     xs: Vec<u32>,           // 各组合数量（初始为手动指定值）
     remaining: Vec<u32>,    // 扣除手动后各户型剩余库存
     free_indices: Vec<usize>, // 参与自动求解的自由组合索引
-    lower: Vec<u32>,        // 自由组合数量下界（"≥1"约束，与 free_indices 对齐）
+    lower: Vec<u32>,        // 自由组合数量下界（组合 min，与 free_indices 对齐）
+    upper: Vec<u32>,        // 自由组合数量上界（组合 max，与 free_indices 对齐）
     weights: Vec<u8>,       // 自由组合权重偏好（1-10，与 free_indices 对齐）
 }
 
@@ -100,23 +101,33 @@ fn prepare(request: &SolveRequest) -> Result<Prepared, String> {
     // 自由组合（未手动指定且有效）
     let free_indices: Vec<usize> = (0..num_combos).filter(|&k| !manual[k] && valid[k]).collect();
 
-    // 处理"≥1"下界约束：勾选的组合必须纳入计算（数量 ≥ 1）
+    // 数量区间约束：自由组合下界 = combination.min、上界 = combination.max
+    //（手动固定数量的组合不参与自由求解，固定值天然优先于区间）
     let mut lower_full = vec![0u32; num_combos];
-    for cid in &request.min_one_combination_ids {
-        let Some(&k) = combo_idx.get(cid.as_str()) else {
-            return Err(format!("≥1 约束引用了不存在的组合: {}", cid));
-        };
+    let mut upper_full = vec![999u32; num_combos];
+    for (k, c) in request.combinations.iter().enumerate() {
         if !valid[k] {
-            return Err(format!(
-                "组合 {} 未包含任何房源，无法设置 ≥1",
-                request.combinations[k].name
-            ));
-        }
-        if manual[k] {
-            // 手动指定数量已 ≥ 1，天然满足，无需额外下界（不冲突）
+            // 空组合（未定义房源）不可参与自动求解；若用户仍设置了区间，直接报错
+            if c.min > 0 || c.max < 999 {
+                return Err(format!("组合 {} 未包含任何房源，无法设置数量区间", c.name));
+            }
             continue;
         }
-        lower_full[k] = 1;
+        if c.min > c.max {
+            return Err(format!(
+                "组合 {} 的数量区间不合法：下限 {} 大于上限 {}",
+                c.name, c.min, c.max
+            ));
+        }
+        lower_full[k] = c.min;
+        upper_full[k] = c.max; // max=0 表示该组合数量恒为 0（等价于不使用）
+    }
+    // 手动固定数量优先于区间：手动组合忽略 min/max（等价于 min=max=固定值）
+    for k in 0..num_combos {
+        if manual[k] {
+            lower_full[k] = 0;
+            upper_full[k] = 999;
+        }
     }
     // 校验所有下界组合（与手动占用合计）不超库存，保证 ILP/贪心均有可行解
     let mut after_lower = remaining.clone();
@@ -125,17 +136,19 @@ fn prepare(request: &SolveRequest) -> Result<Prepared, String> {
             continue;
         }
         for j in 0..num_types {
-            if after_lower[j] < usage[k][j] {
+            let need = usage[k][j].saturating_mul(lower_full[k]);
+            if after_lower[j] < need {
                 return Err(format!(
-                    "≥1 约束超出户型 {} 的库存（剩余 {} 套）",
-                    request.house_types[j].name, after_lower[j]
+                    "组合 {} 的下限 {} 超出户型 {} 的库存（剩余 {} 套）",
+                    request.combinations[k].name, lower_full[k], request.house_types[j].name, after_lower[j]
                 ));
             }
-            after_lower[j] -= usage[k][j];
+            after_lower[j] -= need;
         }
     }
-    // 自由组合下界（与 free_indices 对齐）
+    // 自由组合下界/上界（与 free_indices 对齐）
     let lower: Vec<u32> = free_indices.iter().map(|&k| lower_full[k]).collect();
+    let upper: Vec<u32> = free_indices.iter().map(|&k| upper_full[k]).collect();
 
     // 自由组合权重偏好（与 free_indices 对齐），越界值收敛到 1-10
     let weights: Vec<u8> = free_indices
@@ -150,6 +163,7 @@ fn prepare(request: &SolveRequest) -> Result<Prepared, String> {
         remaining,
         free_indices,
         lower,
+        upper,
         weights,
     })
 }
@@ -226,10 +240,12 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
             prep.free_indices.iter().map(|&k| prep.usage[k].clone()).collect();
         let free_remaining = prep.remaining.clone();
         let free_lower = prep.lower.clone();
+        let free_upper = prep.upper.clone();
         match ilp::solve_ilp_with_cuts_weighted(
             &free_usage,
             &free_remaining,
             &free_lower,
+            &free_upper,
             &prep.weights,
             &[],
         ) {
@@ -240,7 +256,7 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
                 algorithm = "ilp";
             }
             None => {
-                // 贪心降级：先预分配下界（保证 ≥1），再对剩余库存贪心
+                // 贪心降级：先预分配下界（min），再对剩余库存贪心（尊重上限 max）
                 let mut v = vec![0u32; free_usage.len()];
                 let mut rem2 = free_remaining.clone();
                 for (i, &lb) in free_lower.iter().enumerate() {
@@ -251,7 +267,7 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
                         v[i] = lb;
                     }
                 }
-                let g = greedy::solve_greedy(&free_usage, &rem2);
+                let g = greedy::solve_greedy(&free_usage, &rem2, &free_upper);
                 for i in 0..free_usage.len() {
                     v[i] += g[i];
                 }
@@ -261,14 +277,21 @@ pub fn solve(request: &SolveRequest) -> Result<SolveResult, String> {
                 algorithm = "greedy";
             }
         }
-        // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界）。
+        // 公平性：保持总套数不变，均衡各组合数量（方差最小，尊重下界/上界）。
         // 注意：存在权重偏好（任一组合 weight ≠ 5）时跳过均衡化——
         // 均衡转移会抵消"高权重组合优先"的意图（如 10/0 被均衡为 5/5）。
         let has_preference = prep.weights.iter().any(|&w| w != 5);
         if !has_preference {
             let free_totals: Vec<u32> = free_usage.iter().map(|u| u.iter().sum()).collect();
             let mut free_xs: Vec<u32> = prep.free_indices.iter().map(|&k| xs[k]).collect();
-            balance_solution(&free_usage, &free_remaining, &free_totals, &free_lower, &mut free_xs);
+            balance_solution(
+                &free_usage,
+                &free_remaining,
+                &free_totals,
+                &free_lower,
+                &free_upper,
+                &mut free_xs,
+            );
             for (i, &k) in prep.free_indices.iter().enumerate() {
                 xs[k] = free_xs[i];
             }
@@ -327,6 +350,7 @@ pub fn enumerate_solutions(
             &free_usage,
             &free_remaining,
             &prep.lower,
+            &prep.upper,
             &cuts,
             round_timeout,
         ) {
@@ -371,6 +395,7 @@ pub fn balance_solution(
     remaining: &[u32],
     totals: &[u32],
     lower: &[u32],
+    upper: &[u32],
     xs: &mut [u32],
 ) {
     let n = xs.len();
@@ -401,8 +426,12 @@ pub fn balance_solution(
                 }
                 let new_xa = xs[a] - g;
                 let new_xb = xs[b] + h;
-                // 下界保护：转移后不得低于"≥1"等数量下界
+                // 下界保护：转移后不得低于 min（组合下限）
                 if new_xa < lower.get(a).copied().unwrap_or(0) {
+                    continue;
+                }
+                // 上界保护：转移后不得高于 max（组合上限）
+                if new_xb > upper.get(b).copied().unwrap_or(u32::MAX) {
                     continue;
                 }
                 // 校验新解不违反任何户型库存约束
@@ -477,6 +506,8 @@ mod tests {
                     name: "组合A".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![
                         CombinationItem { type_id: "t1".into(), count: 1 },
                         CombinationItem { type_id: "t2".into(), count: 2 },
@@ -488,6 +519,8 @@ mod tests {
                     name: "组合B".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![
                         CombinationItem { type_id: "t2".into(), count: 1 },
                         CombinationItem { type_id: "t3".into(), count: 2 },
@@ -495,7 +528,6 @@ mod tests {
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         }
     }
 
@@ -538,6 +570,8 @@ mod tests {
                 name: "组合A".into(),
                 color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                 items: vec![
                     CombinationItem { type_id: "t1".into(), count: 1 },
                     CombinationItem { type_id: "t2".into(), count: 2 },
@@ -549,6 +583,8 @@ mod tests {
                 name: "空组合".into(),
                 color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                 items: vec![],
             },
         ];
@@ -570,6 +606,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -577,11 +615,12 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let res = solve(&req).unwrap();
         assert_eq!(res.total_used, 10, "总套数必须保持最优");
@@ -604,6 +643,8 @@ mod tests {
                     name: "先定义".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -611,11 +652,12 @@ mod tests {
                     name: "后定义".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let res = solve(&req).unwrap();
         let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
@@ -634,10 +676,10 @@ mod tests {
     }
 
     #[test]
-    fn min_one_forces_inclusion() {
+    fn min_forces_inclusion() {
         // 单户型 10 套；组合1=(1)、组合2=(2)
-        // 未勾选时组合1 可为 0（最优解可能全部由组合2 构成）；
-        // 勾选组合1 "≥1" 后，组合1 数量必须 ≥ 1
+        // min 默认 0 时组合1 可为 0（最优解可能全部由组合2 构成）；
+        // 设置组合1 min=1 后，组合1 数量必须 ≥ 1
         let req = SolveRequest {
             house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
             combinations: vec![
@@ -646,6 +688,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 1,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -653,39 +697,41 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec!["c1".into()],
         };
         let res = solve(&req).unwrap();
         let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
-        assert!(x1 >= 1, "勾选 ≥1 后组合1 数量不得为 0，实际 {x1}");
+        assert!(x1 >= 1, "min=1 后组合1 数量不得为 0，实际 {x1}");
         assert_eq!(res.total_used, 10, "总套数仍应保持最优");
     }
 
     #[test]
-    fn min_one_insufficient_stock_errors() {
-        // 单户型 2 套；组合1 需要 3 套，勾选 ≥1 → 库存不足应报错
+    fn min_insufficient_stock_errors() {
+        // 单户型 2 套；组合1 每套需要 3 套房源，min=1 → 下限需求 3 > 2，应报错
         let req = SolveRequest {
             house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 2 }],
             combinations: vec![Combination {
                 id: "c1".into(),
                 name: "组合1".into(),
                 color: None,
-                    weight: 5,
+                weight: 5,
+                min: 1,
+                max: 999,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
             }],
             manual_inputs: vec![],
-            min_one_combination_ids: vec!["c1".into()],
         };
         assert!(solve(&req).is_err());
     }
 
     #[test]
-    fn min_one_overlap_errors() {
-        // 单户型 4 套；组合1=(3)、组合2=(3) 均勾选 ≥1 → 合计 6 > 4，应报错
+    fn min_overlap_errors() {
+        // 单户型 4 套；组合1=(3)、组合2=(3) 均设 min=1 → 下限合计 6 > 4，应报错
         let req = SolveRequest {
             house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 4 }],
             combinations: vec![
@@ -694,6 +740,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 1,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
                 },
                 Combination {
@@ -701,39 +749,41 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 1,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 3 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec!["c1".into(), "c2".into()],
         };
         assert!(solve(&req).is_err());
     }
 
     #[test]
-    fn min_one_with_manual_no_conflict() {
-        // 手动指定组合1 = 5（已 ≥1），同时勾选 ≥1 → 不冲突，数量仍为 5
+    fn min_with_manual_no_conflict() {
+        // 手动固定组合1 = 5（优先于区间），同时设置 min=1 → 不冲突，数量仍为 5
         let req = SolveRequest {
             house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
             combinations: vec![Combination {
                 id: "c1".into(),
                 name: "组合1".into(),
                 color: None,
-                    weight: 5,
+                weight: 5,
+                min: 1,
+                max: 3,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
             }],
             manual_inputs: vec![ManualInput { combination_id: "c1".into(), quantity: 5 }],
-            min_one_combination_ids: vec!["c1".into()],
         };
         let res = solve(&req).unwrap();
         let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").unwrap();
-        assert_eq!(x1.quantity, 5);
+        assert_eq!(x1.quantity, 5, "手动固定数量优先于区间（min=1/max=3）");
         assert!(x1.is_manual);
     }
 
     #[test]
-    fn min_one_with_enumerate_preserved() {
-        // 枚举备选方案时，"≥1"下界在每个方案中都保留
+    fn min_with_enumerate_preserved() {
+        // 枚举备选方案时，组合 min 下界在每个方案中都保留
         let req = SolveRequest {
             house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
             combinations: vec![
@@ -742,6 +792,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 1,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -749,20 +801,61 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec!["c1".into()],
         };
         let (sols, truncated) = enumerate_solutions(&req, 50).unwrap();
         // 大场景枚举可能截断（大 M 精确割预算限制，仅影响低利用率方案）；
-        // 断言聚焦功能正确性：≥1 约束在枚举到的每个方案中均保留
+        // 断言聚焦功能正确性：min 下界在枚举到的每个方案中均保留
         assert!(sols.len() >= 2, "应至少 2 个方案（截断与否：{truncated}）");
         for s in &sols {
             let x1 = s.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
-            assert!(x1 >= 1, "枚举方案中组合1 数量不得为 0");
+            assert!(x1 >= 1, "枚举方案中组合1 数量不得低于 min");
         }
+    }
+
+    #[test]
+    fn max_limits_quantity() {
+        // 单户型 6 套；组合1=(1) 上限 2 → 数量 ≤ 2（即使库存允许更多）
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 6 }],
+            combinations: vec![Combination {
+                id: "c1".into(),
+                name: "组合1".into(),
+                color: None,
+                weight: 5,
+                min: 0,
+                max: 2,
+                items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+            }],
+            manual_inputs: vec![],
+        };
+        let res = solve(&req).unwrap();
+        let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
+        assert_eq!(x1, 2, "max=2 时组合1 数量应为 2，实际 {x1}");
+    }
+
+    #[test]
+    fn min_max_range_invalid_errors() {
+        // 下限大于上限 → 输入不合法应报错
+        let req = SolveRequest {
+            house_types: vec![HouseType { id: "t1".into(), name: "A".into(), quantity: 10 }],
+            combinations: vec![Combination {
+                id: "c1".into(),
+                name: "组合1".into(),
+                color: None,
+                weight: 5,
+                min: 5,
+                max: 2,
+                items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
+            }],
+            manual_inputs: vec![],
+        };
+        assert!(solve(&req).is_err(), "min > max 应报错");
     }
 
     #[test]
@@ -777,6 +870,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -784,11 +879,12 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 50).unwrap();
         // #9 后 no-good cut 为大 M 精确割，大场景枚举可能因预算截断（仅影响低利用率
@@ -824,10 +920,11 @@ mod tests {
                 name: "组合1".into(),
                 color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                 items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
             }],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 50).unwrap();
         assert!(!truncated, "穷尽场景不应标记截断");
@@ -854,6 +951,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -861,6 +960,8 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
@@ -868,7 +969,6 @@ mod tests {
                 ManualInput { combination_id: "c1".into(), quantity: 2 },
                 ManualInput { combination_id: "c2".into(), quantity: 3 },
             ],
-            min_one_combination_ids: vec![],
         };
         let (sols, _truncated) = enumerate_solutions(&req, 10).unwrap();
         assert_eq!(sols.len(), 1);
@@ -887,6 +987,8 @@ mod tests {
                     name: "高权重".into(),
                     color: None,
                     weight: 10,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -894,11 +996,12 @@ mod tests {
                     name: "低权重".into(),
                     color: None,
                     weight: 1,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let res = solve(&req).unwrap();
         assert_eq!(res.total_used, 10, "利用率必须保持最优");
@@ -918,6 +1021,8 @@ mod tests {
                     name: "组合1".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -925,11 +1030,12 @@ mod tests {
                     name: "组合2".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let res = solve(&req).unwrap();
         let x1 = res.assignments.iter().find(|a| a.combination_id == "c1").map(|a| a.quantity).unwrap_or(0);
@@ -950,6 +1056,8 @@ mod tests {
                     name: "小组合".into(),
                     color: None,
                     weight: 1,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -957,11 +1065,12 @@ mod tests {
                     name: "大组合".into(),
                     color: None,
                     weight: 10,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let res = solve(&req).unwrap();
         assert_eq!(res.total_used, 10, "权重不得牺牲利用率");
@@ -977,9 +1086,10 @@ mod tests {
         let usage: Vec<Vec<u32>> = (0..501).map(|_| vec![1u32]).collect();
         let remaining = vec![1000u32];
         let lower = vec![0u32; 501];
+        let upper = vec![999u32; 501];
         let weights = vec![5u8; 501];
         let cuts: Vec<ilp::Cut> = vec![];
-        let outcome = ilp::solve_ilp_detailed(&usage, &remaining, &lower, &weights, &cuts, 1000);
+        let outcome = ilp::solve_ilp_detailed(&usage, &remaining, &lower, &upper, &weights, &cuts, 1000);
         assert!(
             matches!(outcome, ilp::IlpOutcome::TimedOut),
             "n>500 应返回 TimedOut（可降级），而非 Infeasible（会被枚举误判为穷尽）"
@@ -997,11 +1107,12 @@ mod tests {
                     name: format!("组合{i}"),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 })
                 .collect(),
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 10).unwrap();
         assert!(truncated, "n>500 枚举应置 truncated=true，避免漏解");
@@ -1021,6 +1132,8 @@ mod tests {
                     name: "小组合".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 1 }],
                 },
                 Combination {
@@ -1028,11 +1141,12 @@ mod tests {
                     name: "大组合".into(),
                     color: None,
                     weight: 5,
+                    min: 0,
+                    max: 999,
                     items: vec![CombinationItem { type_id: "t1".into(), count: 2 }],
                 },
             ],
             manual_inputs: vec![],
-            min_one_combination_ids: vec![],
         };
         let (sols, truncated) = enumerate_solutions(&req, 20).unwrap();
         assert!(!truncated, "小规模枚举不应截断");
@@ -1080,9 +1194,10 @@ mod tests {
         let remaining = vec![600u32];
         let totals: Vec<u32> = vec![1u32; n];
         let lower: Vec<u32> = vec![0u32; n];
+        let upper: Vec<u32> = vec![999u32; n];
         let mut xs: Vec<u32> = vec![10u32; n];
         // 不应挂起：迭代上限保证终止；且总套数守恒、已均衡不被破坏
-        balance_solution(&usage, &remaining, &totals, &lower, &mut xs);
+        balance_solution(&usage, &remaining, &totals, &lower, &upper, &mut xs);
         let sum: u32 = xs.iter().sum();
         assert_eq!(sum, 600, "均衡化不得改变总套数");
         assert!(xs.iter().all(|&x| x == xs[0]), "初始已均衡时不应被破坏");

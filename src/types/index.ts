@@ -18,6 +18,10 @@ export interface Combination {
   items: CombinationItem[];
   /** 组合权重偏好（1-10，默认 5）。越高越优先使用（不影响"用完房源"目标） */
   weight?: number;
+  /** 数量区间下限（默认 0）：该组合至少使用几套（替换原"≥1"勾选，可自由设置） */
+  min?: number;
+  /** 数量区间上限（默认 999）：该组合最多使用几套 */
+  max?: number;
 }
 
 export interface ManualInput {
@@ -29,8 +33,7 @@ export interface SolveRequest {
   houseTypes: HouseType[];
   combinations: Combination[];
   manualInputs: ManualInput[];
-  /** 勾选"≥1"的组合 id：这些组合在求解中的数量下界为 1（必须纳入计算） */
-  minOneCombinationIds: string[];
+  /** 组合自身携带数量区间（min/max）；手动固定数量优先于区间 */
 }
 
 export interface CombinationAssignment {

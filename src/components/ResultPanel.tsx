@@ -13,8 +13,6 @@ export default function ResultPanel() {
   const enumerating = useAppStore((s) => s.enumerating);
   const selectSolution = useAppStore((s) => s.selectSolution);
   const enumerateTruncated = useAppStore((s) => s.enumerateTruncated);
-  // "≥1"约束（结果中标注该组合数量最小值为 1）
-  const minOneIds = useAppStore((s) => s.minOneIds);
 
   // 优先展示当前选中的备选方案；否则展示单次计算结果
   const result =
@@ -97,7 +95,17 @@ export default function ResultPanel() {
                 <span className="result-qty">{a.quantity}</span>
                 <span className="muted">个</span>
                 {a.isManual && <span className="tag-manual">手动</span>}
-                {minOneIds.includes(a.combinationId) && <span className="tag-minone">≥1</span>}
+                {(() => {
+                  const c = combinations.find((x) => x.id === a.combinationId);
+                  const min = c?.min ?? 0;
+                  const max = c?.max ?? 999;
+                  if (min > 0 && max < 999) {
+                    return <span className="tag-minone">区间 {min}~{max}</span>;
+                  }
+                  if (min > 0) return <span className="tag-minone">下限 {min}</span>;
+                  if (max < 999) return <span className="tag-minone">上限 {max}</span>;
+                  return null;
+                })()}
               </li>
             );
           })}

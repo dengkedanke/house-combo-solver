@@ -28,10 +28,20 @@ pub struct Combination {
     /// 组合权重偏好（1-10，默认 5）。分层优化阶段二在保持最大利用率下优先高权重组合。
     #[serde(default = "default_weight")]
     pub weight: u8,
+    /// 数量区间下限（默认 0）：该组合至少使用几套（替换原"≥1"勾选，可自由设置）
+    #[serde(default)]
+    pub min: u32,
+    /// 数量区间上限（默认 999）：该组合最多使用几套
+    #[serde(default = "default_max")]
+    pub max: u32,
 }
 
 fn default_weight() -> u8 {
     5
+}
+
+fn default_max() -> u32 {
+    999
 }
 
 /// 手动输入：某个组合指定数量
@@ -49,9 +59,6 @@ pub struct SolveRequest {
     pub house_types: Vec<HouseType>,
     pub combinations: Vec<Combination>,
     pub manual_inputs: Vec<ManualInput>,
-    /// 勾选"≥1"的组合 id：这些组合在求解中的数量下界为 1（必须纳入计算）
-    #[serde(default)]
-    pub min_one_combination_ids: Vec<String>,
 }
 
 /// 单个组合的分配结果

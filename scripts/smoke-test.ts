@@ -28,8 +28,7 @@ console.log('① 基础求解 + 默认权重公平性');
       { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }] },
       { id: 'c2', name: '组合2', items: [{ typeId: 't1', count: 1 }] },
     ],
-    manualInputs: [],
-    minOneCombinationIds: [],
+    manualInputs: []
   });
   check('利用率最优 totalUsed=6', r.totalUsed === 6, `used=${r.totalUsed}`);
   check('默认权重保持均衡 3/3', qty(r, 'c1') === 3 && qty(r, 'c2') === 3, `x1=${qty(r, 'c1')} x2=${qty(r, 'c2')}`);
@@ -44,8 +43,7 @@ console.log('② 权重偏好优先（跳过均衡化）');
       { id: 'c1', name: '高权重', weight: 10, items: [{ typeId: 't1', count: 1 }] },
       { id: 'c2', name: '低权重', weight: 1, items: [{ typeId: 't1', count: 1 }] },
     ],
-    manualInputs: [],
-    minOneCombinationIds: [],
+    manualInputs: []
   });
   check('高权重组合优先 x1>x2', qty(r, 'c1') > qty(r, 'c2'), `x1=${qty(r, 'c1')} x2=${qty(r, 'c2')}`);
   check('权重偏好不牺牲利用率 totalUsed=10', r.totalUsed === 10, `used=${r.totalUsed}`);
@@ -59,8 +57,7 @@ console.log('③ 权重不牺牲利用率（大组合）');
       { id: 'c1', name: '小组合', weight: 1, items: [{ typeId: 't1', count: 1 }] },
       { id: 'c2', name: '大组合', weight: 10, items: [{ typeId: 't1', count: 2 }] },
     ],
-    manualInputs: [],
-    minOneCombinationIds: [],
+    manualInputs: []
   });
   check('利用率保持最优 totalUsed=10', r.totalUsed === 10, `used=${r.totalUsed}`);
   check('高权重大组合更优先 x2>=x1', qty(r, 'c2') >= qty(r, 'c1'), `x1=${qty(r, 'c1')} x2=${qty(r, 'c2')}`);
@@ -77,27 +74,45 @@ console.log('④ 手动输入固定数量');
       { id: 'c1', name: '手动组合', items: [{ typeId: 't1', count: 1 }] },
       { id: 'c2', name: '自由组合', items: [{ typeId: 't2', count: 1 }] },
     ],
-    manualInputs: [{ combinationId: 'c1', quantity: 2 }],
-    minOneCombinationIds: [],
+    manualInputs: [{ combinationId: 'c1', quantity: 2 }]
   });
   const a1 = r.assignments.find((a) => a.combinationId === 'c1');
   check('手动数量固定为 2', a1?.quantity === 2, `qty=${a1?.quantity}`);
   check('手动标记 isManual=true', a1?.isManual === true);
 }
 
-console.log('⑤ ≥1 约束（下界）');
+console.log('⑤ 数量区间（min/max 约束，替换原 ≥1）');
 {
+  // min=1：组合2 必须 ≥1
   const r = jsSolve({
-    houseTypes: [{ id: 't1', name: 'A', quantity: 3 }],
+    houseTypes: [{ id: 't1', name: 'A', quantity: 6 }],
     combinations: [
-      { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }] },
-      { id: 'c2', name: '组合2', items: [{ typeId: 't1', count: 2 }] },
+      { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }], min: 0, max: 999 },
+      { id: 'c2', name: '组合2', items: [{ typeId: 't1', count: 2 }], min: 1, max: 999 },
     ],
     manualInputs: [],
-    minOneCombinationIds: ['c2'],
   });
-  check('≥1 组合数量不小于 1', qty(r, 'c2') >= 1, `c2=${qty(r, 'c2')}`);
-  check('利用率 totalUsed=3', r.totalUsed === 3, `used=${r.totalUsed}`);
+  check('min=1 时组合2 数量 ≥1', qty(r, 'c2') >= 1, `c2=${qty(r, 'c2')}`);
+  check('区间场景利用率 totalUsed=6', r.totalUsed === 6, `used=${r.totalUsed}`);
+  // max=1：组合1 数量 ≤1
+  const r2 = jsSolve({
+    houseTypes: [{ id: 't1', name: 'A', quantity: 6 }],
+    combinations: [
+      { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }], min: 0, max: 1 },
+      { id: 'c2', name: '组合2', items: [{ typeId: 't1', count: 2 }], min: 0, max: 999 },
+    ],
+    manualInputs: [],
+  });
+  check('max=1 时组合1 数量 ≤1', qty(r2, 'c1') <= 1, `c1=${qty(r2, 'c1')}`);
+  // 固定数量优先于区间：手动固定 5，区间 [1,3] → 结果仍为 5
+  const r3 = jsSolve({
+    houseTypes: [{ id: 't1', name: 'A', quantity: 10 }],
+    combinations: [
+      { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }], min: 1, max: 3 },
+    ],
+    manualInputs: [{ combinationId: 'c1', quantity: 5 }],
+  });
+  check('手动固定数量优先于区间', qty(r3, 'c1') === 5, `c1=${qty(r3, 'c1')}`);
 }
 
 console.log('⑥ 遍历备选方案（去重 + 标记）');
@@ -109,8 +124,7 @@ console.log('⑥ 遍历备选方案（去重 + 标记）');
         { id: 'c1', name: '组合1', items: [{ typeId: 't1', count: 1 }] },
         { id: 'c2', name: '组合2', items: [{ typeId: 't1', count: 2 }] },
       ],
-      manualInputs: [],
-      minOneCombinationIds: [],
+      manualInputs: []
     },
     10,
   );
@@ -131,8 +145,7 @@ console.log('⑦ 大组合数（61 个）不崩溃');
       name: `组合${i}`,
       items: [{ typeId: 't1', count: 1 }],
     })),
-    manualInputs: [],
-    minOneCombinationIds: [],
+    manualInputs: []
   });
   check('求解成功（无异常）且用量>0', r.totalUsed > 0, `used=${r.totalUsed}`);
   check('所有数量为非负整数', r.assignments.every((a) => Number.isInteger(a.quantity) && a.quantity >= 0));
@@ -143,8 +156,7 @@ console.log('⑧ 无自由组合（全手动）algorithm=manual-only');
   const r = jsSolve({
     houseTypes: [{ id: 't1', name: 'A', quantity: 5 }],
     combinations: [{ id: 'c1', name: '手动', items: [{ typeId: 't1', count: 1 }] }],
-    manualInputs: [{ combinationId: 'c1', quantity: 5 }],
-    minOneCombinationIds: [],
+    manualInputs: [{ combinationId: 'c1', quantity: 5 }]
   });
   check('algorithm 为 manual-only', r.algorithm === 'manual-only', r.algorithm);
   check('手动数量 5', qty(r, 'c1') === 5);
@@ -152,7 +164,7 @@ console.log('⑧ 无自由组合（全手动）algorithm=manual-only');
 
 console.log('⑨ 空输入不崩溃');
 {
-  const r = jsSolve({ houseTypes: [], combinations: [], manualInputs: [], minOneCombinationIds: [] });
+  const r = jsSolve({ houseTypes: [], combinations: [], manualInputs: [] });
   check('空输入 totalUsed=0', r.totalUsed === 0, `used=${r.totalUsed}`);
 }
 
@@ -168,8 +180,7 @@ console.log('⑩ 多户型混合场景（无 NaN / 负库存）');
       { id: 'c2', name: '仅A', items: [{ typeId: 't1', count: 2 }] },
       { id: 'c3', name: '仅B', items: [{ typeId: 't2', count: 3 }] },
     ],
-    manualInputs: [],
-    minOneCombinationIds: [],
+    manualInputs: []
   });
   const allQty = r.assignments.every((a) => Number.isInteger(a.quantity) && a.quantity >= 0);
   const remOk = r.remaining.every((x) => x.remaining >= 0);

@@ -88,8 +88,6 @@ interface AppState {
   enumerating: boolean;
   /** 枚举是否因超时截断（未完整遍历） */
   enumerateTruncated: boolean;
-  // "≥1"约束：勾选的组合数量下界为 1
-  minOneIds: string[];
   autoCalc: boolean;
   error: string | null;
   lastSolvedBy: 'rust' | 'js' | null;
@@ -104,14 +102,14 @@ interface AppState {
   updateCombination: (id: string, patch: Partial<Combination>) => void;
   /** 更新组合权重偏好（1-10） */
   updateComboWeight: (comboId: string, weight: number) => void;
+  /** 更新组合数量区间（下限/上限，0 ≤ min ≤ max） */
+  updateComboRange: (comboId: string, min: number, max: number) => void;
   removeCombination: (id: string) => void;
   setCombinationItem: (comboId: string, typeId: string, count: number) => void;
 
-  // 手动输入
+  // 手动输入（固定数量优先于区间）
   setManualQuantity: (combinationId: string, quantity: number) => void;
   clearManual: () => void;
-  // "≥1"约束
-  toggleMinOne: (combinationId: string) => void;
 
   // 求解
   setAutoCalc: (v: boolean) => void;
@@ -131,13 +129,44 @@ interface AppState {
 
 export const useAppStore = create<AppState>((set, get) => {
   const buildRequest = () => {
-    const { houseTypes, combinations, manualInputs, minOneIds } = get();
+    const { houseTypes, combinations, manualInputs } = get();
     return {
       houseTypes,
       combinations,
       manualInputs: manualInputs.filter((m) => m.quantity > 0),
-      minOneCombinationIds: minOneIds,
     };
+  };
+
+  // 预校验：所有组合 min 下界对应的最低房源需求是否超过总库存。
+  // 手动固定数量的组合按固定值扣减后剩余库存参与校验。
+  const validateMinStock = (): string | null => {
+    const { houseTypes, combinations, manualInputs } = get();
+    if (houseTypes.length === 0 || combinations.length === 0) return null;
+    // 先扣除手动固定数量占用的库存
+    const remaining = houseTypes.map((t) => t.quantity);
+    for (const m of manualInputs) {
+      if (m.quantity <= 0) continue;
+      const c = combinations.find((x) => x.id === m.combinationId);
+      if (!c) continue;
+      for (const item of c.items) {
+        const j = houseTypes.findIndex((t) => t.id === item.typeId);
+        if (j >= 0) remaining[j] -= item.count * m.quantity;
+      }
+    }
+    // 累加各组合 min 的房源需求（自动组合，跳过手动固定）
+    const manualIds = new Set(manualInputs.filter((m) => m.quantity > 0).map((m) => m.combinationId));
+    for (const c of combinations) {
+      const min = c.min ?? 0;
+      if (min <= 0 || manualIds.has(c.id)) continue;
+      for (const item of c.items) {
+        const j = houseTypes.findIndex((t) => t.id === item.typeId);
+        if (j >= 0 && remaining[j] < item.count * min) {
+          return `组合「${c.name}」的下限 ${min} 超出户型「${houseTypes[j].name}」的库存（剩余 ${Math.max(0, remaining[j])} 套）`;
+        }
+        if (j >= 0) remaining[j] -= item.count * min;
+      }
+    }
+    return null;
   };
 
   return {
@@ -151,7 +180,6 @@ export const useAppStore = create<AppState>((set, get) => {
     activeSolutionIndex: null,
     enumerating: false,
     enumerateTruncated: false,
-    minOneIds: [],
     autoCalc: true,
     error: null,
     lastSolvedBy: null,
@@ -185,6 +213,8 @@ export const useAppStore = create<AppState>((set, get) => {
             name: name || `组合${String.fromCharCode(65 + s.combinations.length)}`,
             items: items.map((i) => ({ ...i })),
             weight: 5,
+            min: 0,
+            max: 999,
           },
         ],
       })),
@@ -201,11 +231,21 @@ export const useAppStore = create<AppState>((set, get) => {
         ),
       })),
 
+    // 数量区间：保证 0 ≤ min ≤ max（输入钳制由 UI 处理，此处兜底规范化）
+    updateComboRange: (comboId, min, max) =>
+      set((s) => ({
+        combinations: s.combinations.map((c) => {
+          if (c.id !== comboId) return c;
+          const lo = Math.max(0, Math.min(Math.round(min || 0), Math.round(max ?? 999)));
+          const hi = Math.max(lo, Math.round(max ?? 999));
+          return { ...c, min: lo, max: hi };
+        }),
+      })),
+
     removeCombination: (id) =>
       set((s) => ({
         combinations: s.combinations.filter((c) => c.id !== id),
         manualInputs: s.manualInputs.filter((m) => m.combinationId !== id),
-        minOneIds: s.minOneIds.filter((x) => x !== id),
       })),
 
     setCombinationItem: (comboId, typeId, count) =>
@@ -228,23 +268,11 @@ export const useAppStore = create<AppState>((set, get) => {
     setManualQuantity: (combinationId, quantity) =>
       set((s) => {
         const others = s.manualInputs.filter((m) => m.combinationId !== combinationId);
-        // M1 修复：手动指定数量后，"≥1"下界约束无意义，自动取消勾选（状态自洽）
-        const minOneIds =
-          quantity > 0
-            ? s.minOneIds.filter((id) => id !== combinationId)
-            : s.minOneIds;
-        if (quantity <= 0) return { manualInputs: others, minOneIds };
-        return { manualInputs: [...others, { combinationId, quantity }], minOneIds };
+        if (quantity <= 0) return { manualInputs: others };
+        return { manualInputs: [...others, { combinationId, quantity }] };
       }),
 
     clearManual: () => set({ manualInputs: [] }),
-
-    toggleMinOne: (combinationId) =>
-      set((s) => ({
-        minOneIds: s.minOneIds.includes(combinationId)
-          ? s.minOneIds.filter((id) => id !== combinationId)
-          : [...s.minOneIds, combinationId],
-      })),
 
     setAutoCalc: (v) => set({ autoCalc: v }),
     setRendering: (v) => set({ rendering: v }),
@@ -254,6 +282,13 @@ export const useAppStore = create<AppState>((set, get) => {
       // 无数据时不计算；组合未完整定义时由求解器自动跳过（数量=0），不影响其他组合
       if (req.houseTypes.length === 0 || req.combinations.length === 0) {
         set({ solveResult: null, calculating: false });
+        return;
+      }
+      // 预校验：所有组合 min 下界的最低房源需求不得超出总库存（弹窗阻止计算）
+      const invalid = validateMinStock();
+      if (invalid) {
+        set({ calculating: false, error: invalid });
+        window.alert(invalid);
         return;
       }
       // #4：登记本次请求序列号，仅最新请求的结果可写入状态
@@ -291,6 +326,13 @@ export const useAppStore = create<AppState>((set, get) => {
       const req = buildRequest();
       if (req.houseTypes.length === 0 || req.combinations.length === 0) {
         set({ error: '请先添加房源类型和组合', enumerating: false });
+        return;
+      }
+      // 预校验：与单方案求解一致（弹窗阻止）
+      const invalid = validateMinStock();
+      if (invalid) {
+        set({ enumerating: false, error: invalid });
+        window.alert(invalid);
         return;
       }
       // #4：枚举同样只接受最新一次请求的结果
@@ -384,7 +426,6 @@ export const useAppStore = create<AppState>((set, get) => {
           },
         ],
         manualInputs: [{ combinationId: 'cA', quantity: 5 }],
-        minOneIds: [],
         solutions: [],
         activeSolutionIndex: null,
         solveResult: null,

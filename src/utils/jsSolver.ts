@@ -6,6 +6,7 @@ function solveGreedyOneOrder(
   usage: number[][],
   remaining: number[],
   order: number[],
+  upper: number[],
 ): { xs: number[]; used: number } {
   const n = usage.length;
   const rem = [...remaining];
@@ -21,6 +22,8 @@ function solveGreedyOneOrder(
       if (u[j] > 0) maxK = Math.min(maxK, Math.floor(rem[j] / u[j]));
     }
     if (maxK === Infinity) maxK = 0;
+    // 数量区间上限约束（组合 max）
+    maxK = Math.min(maxK, upper[k] ?? 999);
     if (maxK > 0) {
       for (let j = 0; j < rem.length; j++) rem[j] -= u[j] * maxK;
       xs[k] = maxK;
@@ -47,12 +50,14 @@ function gcd(a: number, b: number): number {
 }
 
 // 均衡化后处理（与 Rust balance_solution 一致）：
-// 保持总套数（最优值）不变，通过"总量守恒转移"使组合数量方差最小；尊重 lower 下界
+// 保持总套数（最优值）不变，通过"总量守恒转移"使组合数量方差最小；
+// 尊重 lower（min）下界与 upper（max）上界
 function balanceSolution(
   usage: number[][],
   remaining: number[],
   totals: number[],
   lower: number[],
+  upper: number[],
   xs: number[],
 ): void {
   const n = xs.length;
@@ -71,8 +76,10 @@ function balanceSolution(
         if (g > xs[a]) continue;
         const newXa = xs[a] - g;
         const newXb = xs[b] + h;
-        // 下界保护：转移后不得低于"≥1"等数量下界
+        // 下界保护：转移后不得低于 min（组合下限）
         if (newXa < (lower[a] ?? 0)) continue;
+        // 上界保护：转移后不得高于 max（组合上限）
+        if (newXb > (upper[b] ?? 999)) continue;
         // 校验新解不违反任何户型库存约束
         let feasible = true;
         for (let j = 0; j < remaining.length; j++) {
@@ -135,13 +142,13 @@ export function jsSolve(req: SolveRequest): SolveResult {
     return Math.max(0, t.quantity - used);
   });
 
-  // 自由组合贪心（尊重"≥1"下界：先预分配下界，再对剩余库存贪心）
+  // 自由组合贪心（尊重数量区间：先预分配 min 下界，再对剩余库存贪心，且不超过 max 上界）
   const freeIdx = req.combinations.map((_, i) => i).filter((i) => !manual[i]);
   const freeUsage = freeIdx.map((k) => usage[k]);
-  // 自由组合下界（勾选 ≥1 的组合为 1）
-  const lower = freeIdx.map((gi) =>
-    req.minOneCombinationIds?.includes(req.combinations[gi].id) ? 1 : 0,
-  );
+  // 自由组合下界（组合 min，默认 0）
+  const lower = freeIdx.map((gi) => req.combinations[gi].min ?? 0);
+  // 自由组合上界（组合 max，默认 999）
+  const upper = freeIdx.map((gi) => req.combinations[gi].max ?? 999);
   // 自由组合权重偏好（1-10，默认 5）
   const weights = freeIdx.map((gi) => {
     const w = req.combinations[gi].weight ?? 5;
@@ -186,7 +193,7 @@ export function jsSolve(req: SolveRequest): SolveResult {
     // 策略5：权重降序（高权重组合优先，预览近似体现分层优化阶段二）
     orders.push([...freeIdx].sort((a, b) => weights[pos.get(b)!] - weights[pos.get(a)!] || a - b));
     for (const order of orders) {
-      const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!));
+      const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!), upper);
       // 叠加下界预分配
       const full = r.xs.map((x, i) => x + lowerXs[i]);
       const variance = xsVariance(full);
@@ -208,7 +215,7 @@ export function jsSolve(req: SolveRequest): SolveResult {
     // 公平性：仅当无权重偏好时均衡化（否则均衡转移会抵消高权重优先意图）
     const hasPreference = weights.some((w) => w !== 5);
     if (!hasPreference) {
-      balanceSolution(freeUsage, remAfterLower, totals, lower, best.xs);
+      balanceSolution(freeUsage, remAfterLower, totals, lower, upper, best.xs);
     }
     freeIdx.forEach((k, i) => {
       xs[k] = best.xs[i];
@@ -311,21 +318,20 @@ export function jsEnumerate(req: SolveRequest, max = 50): EnumerateResponse {
   const pos = new Map(freeIdx.map((k, i) => [k, i]));
   const totals = freeUsage.map((u) => u.reduce((s, c) => s + c, 0));
 
-  // "≥1"下界：预分配下界组合，剩余库存供贪心/子集变体使用
-  const lower = freeIdx.map((gi) =>
-    req.minOneCombinationIds?.includes(req.combinations[gi].id) ? 1 : 0,
-  );
+  // 数量区间：预分配 min 下界，剩余库存供贪心/子集变体使用；贪心不超 max 上界
+  const lower = freeIdx.map((gi) => req.combinations[gi].min ?? 0);
+  const upper = freeIdx.map((gi) => req.combinations[gi].max ?? 999);
   const lowerXs = new Array(freeIdx.length).fill(0);
   const remAfterLower = [...remaining];
   freeIdx.forEach((_, i) => {
     if (lower[i] > 0) {
       for (let j = 0; j < remAfterLower.length; j++) {
-        remAfterLower[j] -= freeUsage[i][j];
+        remAfterLower[j] -= freeUsage[i][j] * lower[i];
       }
-      lowerXs[i] = 1;
+      lowerXs[i] = lower[i];
     }
   });
-  // 非下界自由组合（子集变体只在这些组合上枚举，保证下界始终满足）
+  // 无下界的自由组合（子集变体只在这些组合上枚举，保证 min 始终满足）
   const freeNonLower = freeIdx.filter((_, i) => lower[i] === 0);
 
   const seen = new Set<string>();
@@ -374,12 +380,12 @@ export function jsEnumerate(req: SolveRequest, max = 50): EnumerateResponse {
     }),
   );
   for (const order of orders) {
-    const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!));
+    const r = solveGreedyOneOrder(freeUsage, remAfterLower, order.map((k) => pos.get(k)!), upper);
     trySolution(r.xs.map((x, i) => x + lowerXs[i]));
     if (results.length >= max) return { solutions: results, truncated: false };
   }
 
-  // 2) 非下界自由组合子集变体（组合数 ≤ 6 时枚举所有非空子集，生成更多备选）
+  // 2) 无下界自由组合子集变体（组合数 ≤ 6 时枚举所有非空子集，生成更多备选）
   if (freeNonLower.length <= 6) {
     for (let mask = 1; mask < 1 << freeNonLower.length && results.length < max; mask++) {
       const subset = freeNonLower.filter((_, i) => (mask & (1 << i)) !== 0);
@@ -388,6 +394,7 @@ export function jsEnumerate(req: SolveRequest, max = 50): EnumerateResponse {
         subUsage,
         [...remAfterLower],
         subset.map((_, i) => i),
+        subset.map((gi) => upper[pos.get(gi)!]),
       );
       const fullSub = lowerXs.slice(); // 下界预分配 + 子集贪心
       // r.xs 按下标顺序对应 subset

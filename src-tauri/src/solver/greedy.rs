@@ -1,6 +1,7 @@
 /// 多起点贪心算法：按多种排序策略尝试分配，取总使用套数最大的方案。
 /// 当 ILP 求解器不可用时作为降级方案。
-pub fn solve_greedy(usage: &[Vec<u32>], remaining: &[u32]) -> Vec<u32> {
+/// upper[k]：组合 k 的数量上限（组合 max）；分配时每组合数量不超过该上限。
+pub fn solve_greedy(usage: &[Vec<u32>], remaining: &[u32], upper: &[u32]) -> Vec<u32> {
     let n = usage.len();
     if n == 0 {
         return vec![];
@@ -54,7 +55,9 @@ pub fn solve_greedy(usage: &[Vec<u32>], remaining: &[u32]) -> Vec<u32> {
                 .filter(|(&c, _)| c > 0)
                 .map(|(&c, &r)| r / c)
                 .min()
-                .unwrap_or(0);
+                .unwrap_or(0)
+                // 数量区间上限约束（组合 max）
+                .min(upper.get(k).copied().unwrap_or(999));
             if max_k > 0 {
                 for j in 0..rem.len() {
                     rem[j] -= usage[k][j].saturating_mul(max_k);
@@ -103,7 +106,8 @@ mod tests {
     fn basic_greedy() {
         let usage = vec![vec![1, 1], vec![2, 1]];
         let remaining = vec![10, 10];
-        let xs = solve_greedy(&usage, &remaining);
+        let upper = vec![999, 999];
+        let xs = solve_greedy(&usage, &remaining, &upper);
         let used: u32 = xs
             .iter()
             .zip(usage.iter())
@@ -116,7 +120,8 @@ mod tests {
     fn cannot_fit() {
         let usage = vec![vec![3]];
         let remaining = vec![2];
-        let xs = solve_greedy(&usage, &remaining);
+        let upper = vec![999];
+        let xs = solve_greedy(&usage, &remaining, &upper);
         assert_eq!(xs[0], 0);
     }
 
@@ -125,8 +130,19 @@ mod tests {
         // 组合未完整定义（全 0）时不得死循环
         let usage = vec![vec![0, 0, 0], vec![1, 1, 1]];
         let remaining = vec![10, 10, 10];
-        let xs = solve_greedy(&usage, &remaining);
+        let upper = vec![999, 999];
+        let xs = solve_greedy(&usage, &remaining, &upper);
         assert_eq!(xs[0], 0);
         assert!(xs[1] >= 1);
+    }
+
+    #[test]
+    fn respects_upper_bound() {
+        // 单户型 10 套；组合1=(1)。上限 3 → 最多分配 3 套
+        let usage = vec![vec![1]];
+        let remaining = vec![10];
+        let upper = vec![3];
+        let xs = solve_greedy(&usage, &remaining, &upper);
+        assert_eq!(xs[0], 3);
     }
 }

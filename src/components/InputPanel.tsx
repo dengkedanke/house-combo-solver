@@ -94,6 +94,7 @@ function CombinationEditor() {
   const setCombinationItem = useAppStore((s) => s.setCombinationItem);
   // #11：从 hook 解构，避免在 JSX 中直接 getState()（保持响应式绑定）
   const updateCombination = useAppStore((s) => s.updateCombination);
+  const updateComboRange = useAppStore((s) => s.updateComboRange);
   const [showForm, setShowForm] = useState(false);
   const [name, setName] = useState('');
   // 待删除的组合（非 null 时弹确认框）
@@ -149,6 +150,37 @@ function CombinationEditor() {
               >
                 ×
               </button>
+            </div>
+            {/* 数量区间（替换原 ≥1 勾选）：下限/上限，store 兜底保证 0 ≤ min ≤ max */}
+            <div className="combo-range">
+              <label className="range-field">
+                <span className="muted">下限</span>
+                <input
+                  type="number"
+                  min={0}
+                  className="qty-input"
+                  value={c.min ?? 0}
+                  onChange={(e) => {
+                    const raw = Number(e.target.value);
+                    const min = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+                    updateComboRange(c.id, min, c.max ?? 999);
+                  }}
+                />
+              </label>
+              <label className="range-field">
+                <span className="muted">上限</span>
+                <input
+                  type="number"
+                  min={0}
+                  className="qty-input"
+                  value={c.max ?? 999}
+                  onChange={(e) => {
+                    const raw = Number(e.target.value);
+                    const max = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+                    updateComboRange(c.id, c.min ?? 0, max);
+                  }}
+                />
+              </label>
             </div>
             <div className="combo-items">
               {houseTypes.map((t) => {
@@ -225,7 +257,7 @@ function WeightPreference() {
   );
 }
 
-/* ---------- 手动输入 ---------- */
+/* ---------- 手动输入（固定数量优先于数量区间） ---------- */
 function ManualInput() {
   const combinations = useAppStore((s) => s.combinations);
   const manualInputs = useAppStore((s) => s.manualInputs);
@@ -235,8 +267,6 @@ function ManualInput() {
   const calculating = useAppStore((s) => s.calculating);
   const enumerateSolutions = useAppStore((s) => s.enumerateSolutions);
   const enumerating = useAppStore((s) => s.enumerating);
-  const minOneIds = useAppStore((s) => s.minOneIds);
-  const toggleMinOne = useAppStore((s) => s.toggleMinOne);
   const hasManual = manualInputs.some((m) => m.quantity > 0);
 
   return (
@@ -255,33 +285,10 @@ function ManualInput() {
       <div className="manual-list">
         {combinations.map((c, idx) => {
           const v = manualInputs.find((m) => m.combinationId === c.id)?.quantity ?? 0;
-          const isEmpty = c.items.length === 0; // 空组合无法分配 ≥1，禁用勾选
-          const isManual = v > 0; // 手动指定后 ≥1 无意义（数量已固定且 ≥1），禁用勾选
-          const checked = minOneIds.includes(c.id) && !isManual;
-          const disabled = isEmpty || isManual;
           return (
             <label key={c.id} className="manual-row">
               <span className="color-dot" style={{ background: getCombinationColor(idx) }} />
               <span className="manual-name">{c.name}</span>
-              {/* "≥1"下界约束：勾选后该组合数量不得为 0 */}
-              <label
-                className={`min-one ${disabled ? 'disabled' : ''}`}
-                title={
-                  isEmpty
-                    ? '组合未包含房源，无法设置 ≥1'
-                    : isManual
-                      ? '已手动指定数量，无需设置 ≥1'
-                      : '勾选后该组合数量最小值为 1'
-                }
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  disabled={disabled}
-                  onChange={() => toggleMinOne(c.id)}
-                />
-                <span>≥1</span>
-              </label>
               <input
                 type="number"
                 min={0}
